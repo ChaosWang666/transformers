@@ -5,6 +5,30 @@
 #                          modular_qwen2_5_vl.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 # coding=utf-8
+"""
+Qwen2.5-VL 模型配置文件
+
+本文件包含 Qwen2.5-VL 多模态大语言模型的配置类定义。Qwen2.5-VL 是一个支持图像、视频和文本
+理解的多模态模型，具有以下主要特点：
+
+1. 多模态架构：
+   - 视觉编码器：处理图像和视频输入，支持任意分辨率
+   - 文本编码器：基于 Qwen2 架构的语言模型
+   - 多模态融合：将视觉特征嵌入到文本序列中
+
+2. 配置层次结构：
+   - Qwen2_5_VLVisionConfig：视觉编码器配置
+   - Qwen2_5_VLTextConfig：文本编码器配置  
+   - Qwen2_5_VLConfig：顶层配置，整合视觉和文本配置
+
+3. 核心功能：
+   - 支持图像理解和描述
+   - 支持视频内容分析
+   - 支持多轮对话
+   - 支持指令跟随
+
+该配置系统为模型的初始化、训练和推理提供了灵活的参数管理机制。
+"""
 # Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
@@ -28,6 +52,28 @@ from ...modeling_rope_utils import rope_config_validation
 
 
 class Qwen2_5_VLVisionConfig(PretrainedConfig):
+    """
+    Qwen2.5-VL 视觉编码器配置类。
+    
+    用于配置视觉 Transformer 的各种参数，包括网络深度、隐藏层大小、注意力头数等。
+    该配置类定义了视觉编码器处理图像和视频输入时的所有关键参数。
+    
+    Args:
+        depth (int, optional): Transformer 层数，默认 32。控制视觉编码器的深度。
+        hidden_size (int, optional): 隐藏层维度，默认 3584。定义每层的特征维度。
+        hidden_act (str, optional): 激活函数类型，默认 "silu"。用于 MLP 层的非线性激活。
+        intermediate_size (int, optional): MLP 中间层维度，默认 3420。前馈网络的中间层大小。
+        num_heads (int, optional): 注意力头数，默认 16。多头注意力机制的头数。
+        in_channels (int, optional): 输入图像通道数，默认 3 (RGB)。
+        patch_size (int, optional): 图像块大小，默认 14x14。将图像分割成块的尺寸。
+        spatial_merge_size (int, optional): 空间合并大小，默认 2x2。用于减少序列长度。
+        temporal_patch_size (int, optional): 时间维度块大小，默认 2。视频帧的时间分组。
+        tokens_per_second (int, optional): 每秒 token 数，默认 4。视频处理的时间分辨率。
+        window_size (int, optional): 窗口大小，默认 112。窗口注意力的窗口尺寸。
+        out_hidden_size (int, optional): 输出隐藏层维度，默认 3584。最终输出的特征维度。
+        fullatt_block_indexes (list, optional): 使用全注意力的层索引，默认 [7, 15, 23, 31]。
+        initializer_range (float, optional): 参数初始化范围，默认 0.02。权重初始化的标准差。
+    """
     model_type = "qwen2_5_vl"
     base_config_key = "vision_config"
 
@@ -51,118 +97,123 @@ class Qwen2_5_VLVisionConfig(PretrainedConfig):
     ):
         super().__init__(**kwargs)
 
-        self.depth = depth
-        self.hidden_size = hidden_size
-        self.hidden_act = hidden_act
-        self.intermediate_size = intermediate_size
-        self.num_heads = num_heads
-        self.in_channels = in_channels
-        self.patch_size = patch_size
-        self.spatial_merge_size = spatial_merge_size
-        self.temporal_patch_size = temporal_patch_size
-        self.tokens_per_second = tokens_per_second
-        self.window_size = window_size
-        self.fullatt_block_indexes = fullatt_block_indexes
-        self.out_hidden_size = out_hidden_size
-        self.initializer_range = initializer_range
+        # 网络结构参数
+        self.depth = depth  # Transformer 层数
+        self.hidden_size = hidden_size  # 隐藏层维度
+        self.hidden_act = hidden_act  # 激活函数类型
+        self.intermediate_size = intermediate_size  # MLP 中间层维度
+        self.num_heads = num_heads  # 注意力头数
+        
+        # 输入处理参数
+        self.in_channels = in_channels  # 输入通道数（RGB=3）
+        self.patch_size = patch_size  # 图像块大小
+        self.spatial_merge_size = spatial_merge_size  # 空间合并大小
+        self.temporal_patch_size = temporal_patch_size  # 时间维度块大小
+        
+        # 视频处理参数
+        self.tokens_per_second = tokens_per_second  # 每秒 token 数
+        
+        # 注意力机制参数
+        self.window_size = window_size  # 窗口注意力大小
+        self.fullatt_block_indexes = fullatt_block_indexes  # 全注意力层索引
+        
+        # 输出和初始化参数
+        self.out_hidden_size = out_hidden_size  # 输出隐藏层维度
+        self.initializer_range = initializer_range  # 参数初始化范围
 
 
 class Qwen2_5_VLTextConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`Qwen2_5_VLTextModel`]. It is used to instantiate a
-    Qwen2-VL model according to the specified arguments, defining the model architecture. Instantiating a configuration
-    with the defaults will yield a similar configuration to that of
-    Qwen2-VL-7B-Instruct [Qwen/Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct).
+    Qwen2.5-VL 文本编码器配置类。
+    
+    用于存储 Qwen2_5_VLTextModel 的配置信息。该配置类用于根据指定的参数实例化
+    Qwen2.5-VL 模型，定义模型架构。使用默认参数实例化配置将产生类似于
+    Qwen2-VL-7B-Instruct [Qwen/Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) 的配置。
 
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
+    配置对象继承自 [`PretrainedConfig`]，可用于控制模型输出。更多信息请参阅
+    [`PretrainedConfig`] 的文档。
+    
+    该配置类定义了 Qwen2.5-VL 模型中文本编码器部分的所有关键参数，包括：
+    - 词汇表和嵌入参数
+    - Transformer 架构参数（层数、注意力头数等）
+    - 位置编码和注意力机制配置
+    - 多模态 token 处理参数
 
     Args:
         vocab_size (`int`, *optional*, defaults to 152064):
-            Vocabulary size of the Qwen2_5_VL model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`Qwen2_5_VLModel`]
+            词汇表大小。定义了传递给 [`Qwen2_5_VLModel`] 的 `inputs_ids` 可以表示的不同 token 数量。
         hidden_size (`int`, *optional*, defaults to 8192):
-            Dimension of the hidden representations.
+            隐藏表示的维度。这是模型内部特征向量的大小。
         intermediate_size (`int`, *optional*, defaults to 29568):
-            Dimension of the MLP representations.
+            MLP（多层感知机）表示的维度。前馈网络中间层的大小。
         num_hidden_layers (`int`, *optional*, defaults to 80):
-            Number of hidden layers in the Transformer encoder.
+            Transformer 编码器中的隐藏层数量。控制模型的深度。
         num_attention_heads (`int`, *optional*, defaults to 64):
-            Number of attention heads for each attention layer in the Transformer encoder.
+            Transformer 编码器中每个注意力层的注意力头数量。
         num_key_value_heads (`int`, *optional*, defaults to 8):
-            This is the number of key_value heads that should be used to implement Grouped Query Attention. If
-            `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
-            `num_key_value_heads=1` the model will use Multi Query Attention (MQA) otherwise GQA is used. When
-            converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
-            by meanpooling all the original heads within that group. For more details, check out [this
-            paper](https://huggingface.co/papers/2305.13245). If it is not specified, will default to `32`.
+            用于实现分组查询注意力（Grouped Query Attention）的键值头数量。如果
+            `num_key_value_heads=num_attention_heads`，模型将使用多头注意力（MHA）；如果
+            `num_key_value_heads=1`，模型将使用多查询注意力（MQA）；否则使用 GQA。
+            将多头检查点转换为 GQA 检查点时，每个组的键值头应通过对该组内所有原始头进行均值池化来构建。
+            更多详情请参阅[此论文](https://huggingface.co/papers/2305.13245)。如果未指定，默认为 `32`。
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
-            The non-linear activation function (function or string) in the decoder.
+            解码器中的非线性激活函数（函数或字符串）。
         max_position_embeddings (`int`, *optional*, defaults to 32768):
-            The maximum sequence length that this model might ever be used with.
+            此模型可能使用的最大序列长度。定义位置编码的范围。
         initializer_range (`float`, *optional*, defaults to 0.02):
-            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+            用于初始化所有权重矩阵的截断正态分布初始化器的标准差。
         rms_norm_eps (`float`, *optional*, defaults to 1e-05):
-            The epsilon used by the rms normalization layers.
+            RMS 归一化层使用的 epsilon 值。用于数值稳定性。
         use_cache (`bool`, *optional*, defaults to `True`):
-            Whether or not the model should return the last key/values attentions (not used by all models). Only
-            relevant if `config.is_decoder=True`.
+            模型是否应返回最后的键/值注意力（并非所有模型都使用）。仅在 `config.is_decoder=True` 时相关。
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-            Whether the model's input and output word embeddings should be tied.
+            模型的输入和输出词嵌入是否应该绑定（共享权重）。
         rope_theta (`float`, *optional*, defaults to 1000000.0):
-            The base period of the RoPE embeddings.
+            RoPE（旋转位置编码）嵌入的基础周期。控制位置编码的频率特性。
         use_sliding_window (`bool`, *optional*, defaults to `False`):
-            Whether to use sliding window attention.
+            是否使用滑动窗口注意力。可以减少长序列的计算复杂度。
         sliding_window (`int`, *optional*, defaults to 4096):
-            Sliding window attention (SWA) window size. If not specified, will default to `4096`.
+            滑动窗口注意力（SWA）的窗口大小。如果未指定，默认为 `4096`。
         max_window_layers (`int`, *optional*, defaults to 80):
-            The number of layers using full attention. The first `max_window_layers` layers will use full attention, while any
-            additional layer afterwards will use SWA (Sliding Window Attention).
+            使用全注意力的层数。前 `max_window_layers` 层将使用全注意力，
+            之后的任何额外层将使用 SWA（滑动窗口注意力）。
         layer_types (`list`, *optional*):
-            Attention pattern for each layer.
+            每层的注意力模式。可以为不同层指定不同的注意力类型。
         attention_dropout (`float`, *optional*, defaults to 0.0):
-            The dropout ratio for the attention probabilities.
+            注意力概率的 dropout 比率。用于正则化防止过拟合。
         rope_scaling (`Dict`, *optional*):
-            Dictionary containing the scaling configuration for the RoPE embeddings. NOTE: if you apply new rope type
-            and you expect the model to work on longer `max_position_embeddings`, we recommend you to update this value
-            accordingly.
-            Expected contents:
+            包含 RoPE 嵌入缩放配置的字典。注意：如果应用新的 rope 类型并期望模型在更长的
+            `max_position_embeddings` 上工作，建议相应地更新此值。
+            预期内容：
                 `rope_type` (`str`):
-                    The sub-variant of RoPE to use. Can be one of ['default', 'linear', 'dynamic', 'yarn', 'longrope',
-                    'llama3'], with 'default' being the original RoPE implementation.
+                    要使用的 RoPE 子变体。可以是 ['default', 'linear', 'dynamic', 'yarn', 'longrope',
+                    'llama3'] 之一，其中 'default' 是原始的 RoPE 实现。
                 `factor` (`float`, *optional*):
-                    Used with all rope types except 'default'. The scaling factor to apply to the RoPE embeddings. In
-                    most scaling types, a `factor` of x will enable the model to handle sequences of length x *
-                    original maximum pre-trained length.
+                    用于除 'default' 外的所有 rope 类型。应用于 RoPE 嵌入的缩放因子。
+                    在大多数缩放类型中，因子 x 将使模型能够处理长度为 x * 原始最大预训练长度的序列。
                 `original_max_position_embeddings` (`int`, *optional*):
-                    Used with 'dynamic', 'longrope' and 'llama3'. The original max position embeddings used during
-                    pretraining.
+                    用于 'dynamic'、'longrope' 和 'llama3'。预训练期间使用的原始最大位置嵌入。
                 `attention_factor` (`float`, *optional*):
-                    Used with 'yarn' and 'longrope'. The scaling factor to be applied on the attention
-                    computation. If unspecified, it defaults to value recommended by the implementation, using the
-                    `factor` field to infer the suggested value.
+                    用于 'yarn' 和 'longrope'。应用于注意力计算的缩放因子。
+                    如果未指定，默认为实现推荐的值，使用 `factor` 字段推断建议值。
                 `beta_fast` (`float`, *optional*):
-                    Only used with 'yarn'. Parameter to set the boundary for extrapolation (only) in the linear
-                    ramp function. If unspecified, it defaults to 32.
+                    仅用于 'yarn'。在线性斜坡函数中设置外推（仅）边界的参数。如果未指定，默认为 32。
                 `beta_slow` (`float`, *optional*):
-                    Only used with 'yarn'. Parameter to set the boundary for interpolation (only) in the linear
-                    ramp function. If unspecified, it defaults to 1.
+                    仅用于 'yarn'。在线性斜坡函数中设置插值（仅）边界的参数。如果未指定，默认为 1。
                 `short_factor` (`list[float]`, *optional*):
-                    Only used with 'longrope'. The scaling factor to be applied to short contexts (<
-                    `original_max_position_embeddings`). Must be a list of numbers with the same length as the hidden
-                    size divided by the number of attention heads divided by 2
+                    仅用于 'longrope'。应用于短上下文（< `original_max_position_embeddings`）的缩放因子。
+                    必须是长度等于隐藏大小除以注意力头数再除以 2 的数字列表。
                 `long_factor` (`list[float]`, *optional*):
-                    Only used with 'longrope'. The scaling factor to be applied to long contexts (<
-                    `original_max_position_embeddings`). Must be a list of numbers with the same length as the hidden
-                    size divided by the number of attention heads divided by 2
+                    仅用于 'longrope'。应用于长上下文（< `original_max_position_embeddings`）的缩放因子。
+                    必须是长度等于隐藏大小除以注意力头数再除以 2 的数字列表。
                 `low_freq_factor` (`float`, *optional*):
-                    Only used with 'llama3'. Scaling factor applied to low frequency components of the RoPE
+                    仅用于 'llama3'。应用于 RoPE 低频分量的缩放因子。
                 `high_freq_factor` (`float`, *optional*):
-                    Only used with 'llama3'. Scaling factor applied to high frequency components of the RoPE
+                    仅用于 'llama3'。应用于 RoPE 高频分量的缩放因子。
         image_token_id (`int`, *optional*):
-            Token index used as placeholder for image embeddings.
+            用作图像嵌入占位符的 token 索引。
         video_token_id (`int`, *optional*):
-            Token index used as placeholder for video embeddings.
+            用作视频嵌入占位符的 token 索引。
 
     ```python
     >>> from transformers import Qwen2_5_VLTextModel, Qwen2_5_VLConfig
@@ -272,35 +323,42 @@ class Qwen2_5_VLTextConfig(PretrainedConfig):
 
 class Qwen2_5_VLConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`Qwen2_5_VLModel`]. It is used to instantiate a
-    Qwen2-VL model according to the specified arguments, defining the model architecture. Instantiating a configuration
-    with the defaults will yield a similar configuration to that of
-    Qwen2-VL-7B-Instruct [Qwen/Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct).
+    Qwen2.5-VL 模型的配置类。
+    
+    这是用于存储 [`Qwen2_5_VLModel`] 配置的配置类。它用于根据指定的参数实例化
+    Qwen2.5-VL 模型，定义模型架构。使用默认值实例化配置将产生类似于
+    Qwen2.5-VL-7B-Instruct [Qwen/Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) 的配置。
 
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
+    配置对象继承自 [`PretrainedConfig`] 并可用于控制模型输出。有关更多信息，
+    请阅读 [`PretrainedConfig`] 的文档。
 
+    该配置类整合了视觉编码器和文本编码器的配置，提供了完整的多模态模型配置管理。
+    它定义了模型架构的所有关键参数，包括特殊 token 的 ID 和各个组件的配置。
 
     Args:
         text_config (`Union[PreTrainedConfig, dict]`, *optional*, defaults to `Qwen2_5_VLTextConfig`):
-            The config object or dictionary of the text backbone.
+            文本骨干网络的配置对象或字典。定义文本编码器的所有参数，包括词汇表大小、
+            隐藏层维度、注意力头数等。
         vision_config (`Union[PreTrainedConfig, dict]`,  *optional*, defaults to `Qwen2_5_VLVisionConfig`):
-            The config object or dictionary of the vision backbone.
+            视觉骨干网络的配置对象或字典。定义视觉编码器的所有参数，包括图像块大小、
+            Transformer 层数、注意力机制等。
         image_token_id (`int`, *optional*, defaults to 151655):
-            The image token index to encode the image prompt.
+            用于编码图像提示的图像 token 索引。在处理包含图像的输入时，
+            此 token 用作图像内容的占位符。
         video_token_id (`int`, *optional*, defaults to 151656):
-            The video token index to encode the image prompt.
+            用于编码视频提示的视频 token 索引。在处理包含视频的输入时，
+            此 token 用作视频内容的占位符。
 
     ```python
     >>> from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLConfig
 
-    >>> # Initializing a Qwen2_5_VL style configuration
+    >>> # 初始化 Qwen2_5_VL 风格的配置
     >>> configuration = Qwen2_5_VLConfig()
 
-    >>> # Initializing a model from the Qwen2-VL-7B style configuration
+    >>> # 从 Qwen2.5-VL-7B 风格配置初始化模型
     >>> model = Qwen2_5_VLForConditionalGeneration(configuration)
 
-    >>> # Accessing the model configuration
+    >>> # 访问模型配置
     >>> configuration = model.config
     ```"""
 

@@ -50,6 +50,16 @@ logger = logging.get_logger(__name__)
 
 
 class Qwen2_5_VLMLP(nn.Module):
+    """
+    Qwen2.5-VL 多层感知机（MLP）模块。
+    
+    实现标准的 SwiGLU 激活函数的前馈网络，包含门控机制。
+    这是 Transformer 块中的前馈网络组件。
+    
+    Args:
+        config: 模型配置对象
+        bias (bool): 是否在线性层中使用偏置，默认 False
+    """
     def __init__(self, config, bias: bool = False):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -64,6 +74,18 @@ class Qwen2_5_VLMLP(nn.Module):
 
 
 class Qwen2_5_VisionPatchEmbed(nn.Module):
+    """
+    Qwen2.5-VL 视觉块嵌入模块。
+    
+    将输入的图像或视频块转换为嵌入向量。使用 3D 卷积处理时空信息，
+    支持图像（时间维度为1）和视频（时间维度>1）输入。
+    
+    Args:
+        patch_size (int): 空间块大小，默认 14
+        temporal_patch_size (int): 时间块大小，默认 2
+        in_channels (int): 输入通道数，默认 3（RGB）
+        embed_dim (int): 嵌入维度，默认 1152
+    """
     def __init__(
         self,
         patch_size: int = 14,
@@ -90,6 +112,15 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
 
 
 class Qwen2_5_VisionRotaryEmbedding(nn.Module):
+    """
+    Qwen2.5-VL 视觉旋转位置编码模块。
+    
+    为视觉 Transformer 生成旋转位置编码（RoPE），用于编码位置信息。
+    
+    Args:
+        dim (int): 嵌入维度
+        theta (float): RoPE 的基础频率，默认 10000.0
+    """
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
@@ -104,10 +135,17 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
 
 
 class Qwen2RMSNorm(nn.Module):
+    """
+    Qwen2 RMS 归一化层。
+    
+    实现 Root Mean Square 归一化，等价于 T5LayerNorm。
+    用于稳定训练和提高模型性能。
+    
+    Args:
+        hidden_size (int): 隐藏层维度
+        eps (float): 数值稳定性的小常数，默认 1e-6
+    """
     def __init__(self, hidden_size, eps=1e-6):
-        """
-        Qwen2RMSNorm is equivalent to T5LayerNorm
-        """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
@@ -124,6 +162,17 @@ class Qwen2RMSNorm(nn.Module):
 
 
 class Qwen2_5_VLPatchMerger(nn.Module):
+    """
+    Qwen2.5-VL 块合并器。
+    
+    将多个相邻的视觉块合并为单个块，以减少序列长度并提高计算效率。
+    使用 MLP 网络进行特征变换和维度调整。
+    
+    Args:
+        dim (int): 输出维度
+        context_dim (int): 输入上下文维度
+        spatial_merge_size (int): 空间合并大小，默认 2（即 2x2 合并）
+    """
     def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
@@ -140,35 +189,104 @@ class Qwen2_5_VLPatchMerger(nn.Module):
 
 
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    """
+    旋转输入张量的一半隐藏维度。
+    
+    这是旋转位置编码（RoPE）的核心操作，将输入张量的后半部分取负号并与前半部分交换位置。
+    用于实现复数乘法的旋转操作。
+    
+    Args:
+        x (torch.Tensor): 输入张量，shape: (..., hidden_dim)
+    
+    Returns:
+        torch.Tensor: 旋转后的张量，shape 与输入相同
+    
+    示例:
+        如果输入 x = [a, b, c, d]，则输出为 [-c, -d, a, b]
+    """
+    x1 = x[..., : x.shape[-1] // 2]  # 前半部分
+    x2 = x[..., x.shape[-1] // 2 :]  # 后半部分
+    return torch.cat((-x2, x1), dim=-1)  # 拼接：(-后半部分, 前半部分)
 
 
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    为视觉模型的查询和键张量应用旋转位置编码（RoPE）。
+    
+    旋转位置编码通过复数乘法的方式将位置信息编码到查询和键向量中，
+    使模型能够理解序列中元素的相对位置关系。对于视觉模型，这有助于
+    理解图像块之间的空间关系。
+    
+    Args:
+        q (torch.Tensor): 查询张量，shape: (batch_size, num_heads, seq_len, head_dim)
+        k (torch.Tensor): 键张量，shape: (batch_size, num_heads, seq_len, head_dim)
+        cos (torch.Tensor): 余弦位置编码，shape: (seq_len, head_dim)
+        sin (torch.Tensor): 正弦位置编码，shape: (seq_len, head_dim)
+    
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: 应用 RoPE 后的查询和键张量
+            - q_embed: 编码后的查询张量
+            - k_embed: 编码后的键张量
+    
+    注意:
+        计算过程中会转换为 float32 以提高数值稳定性，最后恢复原始数据类型。
+    """
+    # 保存原始数据类型
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
+    
+    # 转换为 float32 以提高数值稳定性
     q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()  # 增加 head 维度
+    
+    # 应用旋转位置编码：复数乘法的实数形式
+    # q_embed = q * cos + rotate_half(q) * sin
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
+    
+    # 恢复原始数据类型
     q_embed = q_embed.to(orig_q_dtype)
     k_embed = k_embed.to(orig_k_dtype)
+    
     return q_embed, k_embed
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    重复键值对张量以匹配查询头的数量。
+    
+    在分组查询注意力（GQA）中，键值对头的数量通常少于查询头的数量。
+    此函数通过重复键值对张量来匹配查询头的数量，实现高效的注意力计算。
+    
+    等价于 torch.repeat_interleave(x, dim=1, repeats=n_rep)。
+    
+    Args:
+        hidden_states (torch.Tensor): 输入的键或值张量
+            shape: (batch, num_key_value_heads, seqlen, head_dim)
+        n_rep (int): 重复次数，通常等于 num_attention_heads // num_key_value_heads
+    
+    Returns:
+        torch.Tensor: 重复后的张量
+            shape: (batch, num_attention_heads, seqlen, head_dim)
+    
+    示例:
+        如果 num_key_value_heads=2, num_attention_heads=8，则 n_rep=4
+        输入 shape: (batch, 2, seqlen, head_dim)
+        输出 shape: (batch, 8, seqlen, head_dim)
     """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    
+    # 如果不需要重复，直接返回
     if n_rep == 1:
         return hidden_states
+    
+    # 在第3维插入新维度并扩展，然后重塑为目标形状
+    # (batch, num_kv_heads, 1, slen, head_dim) -> (batch, num_kv_heads, n_rep, slen, head_dim)
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    
+    # 重塑为最终形状: (batch, num_kv_heads * n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -182,23 +300,76 @@ def eager_attention_forward(
     dropout: float = 0.0,
     **kwargs,
 ):
+    """
+    执行标准的多头注意力前向传播（eager 模式）。
+    
+    实现标准的缩放点积注意力机制，支持分组查询注意力（GQA）。
+    使用 PyTorch 的标准操作进行计算，相对于优化的实现（如 Flash Attention）
+    更容易调试但可能效率较低。
+    
+    Args:
+        module (nn.Module): 注意力模块，用于获取配置信息
+        query (torch.Tensor): 查询张量，shape: (batch, num_heads, seq_len, head_dim)
+        key (torch.Tensor): 键张量，shape: (batch, num_kv_heads, seq_len, head_dim)
+        value (torch.Tensor): 值张量，shape: (batch, num_kv_heads, seq_len, head_dim)
+        attention_mask (Optional[torch.Tensor]): 注意力掩码，用于屏蔽某些位置
+        scaling (float): 缩放因子，通常为 1/sqrt(head_dim)
+        dropout (float): dropout 概率，默认 0.0
+        **kwargs: 其他参数（未使用）
+    
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: 
+            - attn_output: 注意力输出，shape: (batch, seq_len, num_heads, head_dim)
+            - attn_weights: 注意力权重，shape: (batch, num_heads, seq_len, seq_len)
+    
+    计算流程:
+        1. 重复键值对以匹配查询头数量（用于 GQA）
+        2. 计算注意力分数：Q @ K^T * scaling
+        3. 应用注意力掩码
+        4. Softmax 归一化
+        5. 应用 dropout
+        6. 计算最终输出：attention_weights @ V
+    """
+    # 1. 重复键值对张量以匹配查询头数量（用于分组查询注意力）
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
+    # 2. 计算注意力分数：Q @ K^T，并应用缩放因子
+    # attn_weights: (batch, num_heads, seq_len, seq_len)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    
+    # 3. 应用注意力掩码（如果提供）
     if attention_mask is not None:
+        # 裁剪掩码以匹配键的序列长度
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
+        attn_weights = attn_weights + causal_mask  # 加法掩码（负无穷表示屏蔽）
 
+    # 4. Softmax 归一化（使用 float32 提高数值稳定性）
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    
+    # 5. 应用 dropout
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    
+    # 6. 计算最终输出：attention_weights @ V
+    # attn_output: (batch, num_heads, seq_len, head_dim)
     attn_output = torch.matmul(attn_weights, value_states)
+    
+    # 7. 转置以匹配期望的输出格式：(batch, seq_len, num_heads, head_dim)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
 
 
 class Qwen2_5_VLVisionAttention(nn.Module):
+    """
+    Qwen2.5-VL 视觉注意力模块。
+    
+    实现多头自注意力机制，支持旋转位置编码和多种注意力实现方式。
+    可以处理变长序列并支持 Flash Attention 等优化实现。
+    
+    Args:
+        config (Qwen2_5_VLVisionConfig): 视觉配置对象
+    """
     def __init__(self, config: Qwen2_5_VLVisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -293,6 +464,16 @@ class Qwen2_5_VLVisionAttention(nn.Module):
 
 
 class Qwen2_5_VLVisionBlock(GradientCheckpointingLayer):
+    """
+    Qwen2.5-VL 视觉 Transformer 块。
+    
+    包含多头自注意力和前馈网络，使用残差连接和 RMS 归一化。
+    支持梯度检查点以节省内存，可配置不同的注意力实现方式。
+    
+    Args:
+        config: 视觉配置对象
+        attn_implementation (str): 注意力实现方式，默认 "sdpa"
+    """
     def __init__(self, config, attn_implementation: str = "sdpa") -> None:
         super().__init__()
         self.norm1 = Qwen2RMSNorm(config.hidden_size, eps=1e-6)
@@ -334,6 +515,21 @@ class Qwen2_5_VLPreTrainedModel(PreTrainedModel):
 
 
 class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
+    """
+    Qwen2.5-VL 视觉 Transformer 预训练模型。
+    
+    实现完整的视觉编码器，包括图像/视频块嵌入、旋转位置编码、
+    多层 Transformer 块和空间块合并。支持任意分辨率图像和变长视频处理。
+    
+    主要组件：
+    - 块嵌入：将图像/视频块转换为嵌入向量
+    - 旋转位置编码：提供 3D 位置信息
+    - Transformer 块：多层自注意力和前馈网络
+    - 块合并器：减少序列长度提高效率
+    
+    Args:
+        config (Qwen2_5_VLVisionConfig): 视觉配置对象
+    """
     config: Qwen2_5_VLVisionConfig
     _no_split_modules = ["Qwen2_5_VLVisionBlock"]
 
@@ -955,30 +1151,52 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
 
 @auto_docstring
 class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
-    base_model_prefix = ""
-    _checkpoint_conversion_mapping = {"^model": "language_model"}
-    config: Qwen2_5_VLConfig
-    _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"]
+    """
+    Qwen2.5-VL多模态模型的核心类，整合视觉编码器和语言模型。
+    
+    该类负责：
+    1. 管理视觉编码器（visual）和语言模型（language_model）
+    2. 处理图像和视频的特征提取
+    3. 计算3D RoPE位置编码
+    4. 融合多模态特征并生成统一的表示
+    """
+    base_model_prefix = ""  # 基础模型前缀，用于权重加载
+    _checkpoint_conversion_mapping = {"^model": "language_model"}  # 检查点转换映射
+    config: Qwen2_5_VLConfig  # 模型配置
+    _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"]  # 不可分割的模块列表
 
     def __init__(self, config):
+        """
+        初始化Qwen2.5-VL模型。
+        
+        Args:
+            config (Qwen2_5_VLConfig): 模型配置，包含视觉和文本配置
+        """
         super().__init__(config)
+        # 初始化视觉编码器，用于处理图像和视频输入
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
+        # 初始化语言模型，用于文本理解和生成
         self.language_model = Qwen2_5_VLTextModel._from_config(config.text_config)
-        self.rope_deltas = None  # cache rope_deltas here
+        # 缓存RoPE偏移量，用于优化解码阶段的位置计算
+        self.rope_deltas = None  # 形状: (batch_size,)
 
-        # Initialize weights and apply final processing
+        # 初始化权重并应用最终处理
         self.post_init()
 
     def get_input_embeddings(self):
+        """获取语言模型的输入嵌入层。"""
         return self.language_model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
+        """设置语言模型的输入嵌入层。"""
         self.language_model.set_input_embeddings(value)
 
     def set_decoder(self, decoder):
+        """设置语言模型解码器。"""
         self.language_model = decoder
 
     def get_decoder(self):
+        """获取语言模型解码器。"""
         return self.language_model
 
     def get_rope_index(
@@ -1167,33 +1385,71 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self, pixel_values_videos: torch.FloatTensor, video_grid_thw: Optional[torch.LongTensor] = None
     ):
         """
+        将视频编码为连续的嵌入向量，可以传递给语言模型。
         Encodes videos into continuous embeddings that can be forwarded to the language model.
 
         Args:
             pixel_values_videos (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+                输入视频对应的张量。
                 The tensors corresponding to the input videos.
             video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+                每个视频在LLM中的时间、高度和宽度特征形状。
                 The temporal, height and width of feature shape of each video in LLM.
+        
+        Returns:
+            video_embeds: 分割后的视频嵌入向量列表，每个元素对应一个视频的特征
+                         List of split video embeddings, each element corresponds to features of one video
         """
+        # 将输入视频张量转换为视觉编码器的数据类型
+        # Convert input video tensor to visual encoder's data type
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+        
+        # 通过视觉编码器处理视频，得到视频嵌入向量
+        # Process videos through visual encoder to get video embeddings
+        # video_embeds shape: (total_video_tokens, hidden_size)
         video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        
+        # 计算每个视频的分割大小：时间*高度*宽度 / 空间合并大小的平方
+        # Calculate split size for each video: temporal*height*width / spatial_merge_size^2
         split_sizes = (video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        
+        # 根据分割大小将视频嵌入向量分割为每个视频对应的部分
+        # Split video embeddings according to split sizes for each video
         video_embeds = torch.split(video_embeds, split_sizes)
         return video_embeds
 
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
         """
+        将图像编码为连续的嵌入向量，可以传递给语言模型。
         Encodes images into continuous embeddings that can be forwarded to the language model.
 
         Args:
             pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+                输入图像对应的张量。
                 The tensors corresponding to the input images.
             image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+                每个图像在LLM中的时间、高度和宽度特征形状。
                 The temporal, height and width of feature shape of each image in LLM.
+        
+        Returns:
+            image_embeds: 分割后的图像嵌入向量列表，每个元素对应一个图像的特征
+                         List of split image embeddings, each element corresponds to features of one image
         """
+        # 将输入图像张量转换为视觉编码器的数据类型
+        # Convert input image tensor to visual encoder's data type
         pixel_values = pixel_values.type(self.visual.dtype)
+        
+        # 通过视觉编码器处理图像，得到图像嵌入向量
+        # Process images through visual encoder to get image embeddings
+        # image_embeds shape: (total_image_tokens, hidden_size)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        
+        # 计算每个图像的分割大小：时间*高度*宽度 / 空间合并大小的平方
+        # Calculate split size for each image: temporal*height*width / spatial_merge_size^2
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        
+        # 根据分割大小将图像嵌入向量分割为每个图像对应的部分
+        # Split image embeddings according to split sizes for each image
         image_embeds = torch.split(image_embeds, split_sizes)
         return image_embeds
 
@@ -1205,31 +1461,62 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         video_features: torch.FloatTensor = None,
     ):
         """
+        从 `input_ids` 或 `inputs_embeds` 中获取多模态占位符掩码，并检查占位符token数量是否等于多模态特征的长度。
+        如果长度不匹配，将抛出错误。
         Obtains multimodal placeholdr mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
         equal to the length of multimodal features. If the lengths are different, an error is raised.
+        
+        Args:
+            input_ids: 输入token序列，形状: (batch_size, sequence_length)
+            inputs_embeds: 输入嵌入向量，形状: (batch_size, sequence_length, hidden_size)
+            image_features: 图像特征，可选
+            video_features: 视频特征，可选
+        
+        Returns:
+            special_image_mask: 图像占位符掩码，形状: (batch_size, sequence_length, hidden_size)
+            special_video_mask: 视频占位符掩码，形状: (batch_size, sequence_length, hidden_size)
         """
+        # 如果没有提供input_ids，则从inputs_embeds中查找占位符
+        # If input_ids is not provided, find placeholders from inputs_embeds
         if input_ids is None:
+            # 通过比较嵌入向量与图像token嵌入来找到图像占位符位置
+            # Find image placeholder positions by comparing embeddings with image token embedding
             special_image_mask = inputs_embeds == self.get_input_embeddings()(
                 torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
             )
-            special_image_mask = special_image_mask.all(-1)
+            special_image_mask = special_image_mask.all(-1)  # 在最后一个维度上进行all操作
+            
+            # 通过比较嵌入向量与视频token嵌入来找到视频占位符位置
+            # Find video placeholder positions by comparing embeddings with video token embedding
             special_video_mask = inputs_embeds == self.get_input_embeddings()(
                 torch.tensor(self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
             )
-            special_video_mask = special_video_mask.all(-1)
+            special_video_mask = special_video_mask.all(-1)  # 在最后一个维度上进行all操作
         else:
+            # 直接从input_ids中查找图像和视频token的位置
+            # Directly find image and video token positions from input_ids
             special_image_mask = input_ids == self.config.image_token_id
             special_video_mask = input_ids == self.config.video_token_id
 
+        # 计算图像token的数量并扩展掩码维度以匹配inputs_embeds
+        # Count image tokens and expand mask dimensions to match inputs_embeds
         n_image_tokens = special_image_mask.sum()
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        
+        # 验证图像特征数量与图像token数量是否匹配
+        # Validate that image features count matches image token count
         if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
             )
 
+        # 计算视频token的数量并扩展掩码维度以匹配inputs_embeds
+        # Count video tokens and expand mask dimensions to match inputs_embeds
         n_video_tokens = special_video_mask.sum()
         special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        
+        # 验证视频特征数量与视频token数量是否匹配
+        # Validate that video features count matches video token count
         if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
             raise ValueError(
                 f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
@@ -1240,22 +1527,22 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     @auto_docstring
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        rope_deltas: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        second_per_grid_ts: Optional[torch.Tensor] = None,
+        input_ids: torch.LongTensor = None,  # 输入token序列，形状: (batch_size, sequence_length)
+        attention_mask: Optional[torch.Tensor] = None,  # 注意力掩码，形状: (batch_size, sequence_length)
+        position_ids: Optional[torch.LongTensor] = None,  # 位置ID，形状: (3, batch_size, sequence_length) 或 (4, batch_size, sequence_length)
+        past_key_values: Optional[Cache] = None,  # 缓存的键值对，用于加速生成
+        inputs_embeds: Optional[torch.FloatTensor] = None,  # 输入嵌入，形状: (batch_size, sequence_length, hidden_size)
+        use_cache: Optional[bool] = None,  # 是否使用缓存
+        output_attentions: Optional[bool] = None,  # 是否输出注意力权重
+        output_hidden_states: Optional[bool] = None,  # 是否输出隐藏状态
+        return_dict: Optional[bool] = None,  # 是否返回字典格式
+        pixel_values: Optional[torch.Tensor] = None,  # 图像像素值，形状: (num_images, channels, height, width)
+        pixel_values_videos: Optional[torch.FloatTensor] = None,  # 视频像素值，形状: (num_videos, frames, channels, height, width)
+        image_grid_thw: Optional[torch.LongTensor] = None,  # 图像网格时空尺寸，形状: (num_images, 3) [temporal, height, width]
+        video_grid_thw: Optional[torch.LongTensor] = None,  # 视频网格时空尺寸，形状: (num_videos, 3) [temporal, height, width]
+        rope_deltas: Optional[torch.LongTensor] = None,  # RoPE位置偏移量，形状: (batch_size,)
+        cache_position: Optional[torch.LongTensor] = None,  # 缓存位置，形状: (sequence_length,)
+        second_per_grid_ts: Optional[torch.Tensor] = None,  # 每个时间网格的秒数，形状: (num_videos,)
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen2_5_VLModelOutputWithPast]:
         r"""
@@ -1269,36 +1556,57 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
         """
 
+        # 设置输出配置参数
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # 如果没有提供输入嵌入，则从input_ids生成
+        # inputs_embeds: (batch_size, sequence_length, hidden_size)
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
+        # 处理图像输入
         if pixel_values is not None:
+            # 获取图像特征，每个图像返回一个特征张量列表
+            # image_embeds: List[torch.Tensor], 每个元素形状为 (image_tokens, hidden_size)
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            # 将所有图像特征拼接成一个张量
+            # image_embeds: (total_image_tokens, hidden_size)
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            # 获取图像占位符掩码，用于定位图像token在序列中的位置
+            # image_mask: (batch_size, sequence_length, hidden_size)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
+            # 将图像特征嵌入到对应的占位符位置
+            # inputs_embeds: (batch_size, sequence_length, hidden_size)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
+        # 处理视频输入
         if pixel_values_videos is not None:
+            # 获取视频特征，每个视频返回一个特征张量列表
+            # video_embeds: List[torch.Tensor], 每个元素形状为 (video_tokens, hidden_size)
             video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+            # 将所有视频特征拼接成一个张量
+            # video_embeds: (total_video_tokens, hidden_size)
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            # 获取视频占位符掩码，用于定位视频token在序列中的位置
+            # video_mask: (batch_size, sequence_length, hidden_size)
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
+            # 将视频特征嵌入到对应的占位符位置
+            # inputs_embeds: (batch_size, sequence_length, hidden_size)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
+        # 计算位置ID和RoPE偏移量
         if position_ids is None:
-            # Calculate RoPE index once per generation in the pre-fill stage only.
-            # When compiling, we can't check tensor values thus we check only input length
-            # It is safe to assume that `length!=1` means we're in pre-fill because compiled
-            # models currently cannot do asssisted decoding
+            # 在预填充阶段只计算一次RoPE索引
+            # 编译时无法检查张量值，因此只检查输入长度
+            # 可以安全地假设 length!=1 意味着我们处于预填充阶段，因为编译模型目前无法进行辅助解码
             prefill_compiled_stage = is_torchdynamo_compiling() and (
                 (input_ids is not None and input_ids.shape[1] != 1)
                 or (inputs_embeds is not None and inputs_embeds.shape[1] != 1)
@@ -1307,7 +1615,11 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 (cache_position is not None and cache_position[0] == 0)
                 or (past_key_values is None or past_key_values.get_seq_length() == 0)
             )
+            # 如果是预填充阶段或者还没有计算过rope_deltas，则重新计算
             if (prefill_compiled_stage or prefill_noncompiled_stage) or self.rope_deltas is None:
+                # 计算3D位置ID和RoPE偏移量
+                # position_ids: (4, batch_size, sequence_length) - 包含文本位置和3D视觉位置
+                # rope_deltas: (batch_size,) - 序列长度与多模态RoPE之间的索引差异
                 position_ids, rope_deltas = self.get_rope_index(
                     input_ids,
                     image_grid_thw,
@@ -1317,36 +1629,48 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 )
                 self.rope_deltas = rope_deltas
             else:
+                # 解码阶段：使用缓存的rope_deltas计算位置ID
                 batch_size, seq_length, _ = inputs_embeds.shape
+                # 创建基础位置ID序列: (sequence_length,)
                 position_ids = torch.arange(seq_length, device=inputs_embeds.device)
+                # 扩展为3D位置格式: (3, batch_size, sequence_length)
                 position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
+                # 应用缓存的RoPE偏移量
                 if cache_position is not None:
+                    # delta: (batch_size,)
                     delta = (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
                 else:
+                    # delta: (batch_size, sequence_length)
                     delta = torch.zeros((batch_size, seq_length), device=inputs_embeds.device)
+                # 重复delta以匹配batch维度
                 delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=1)
+                # 将偏移量添加到位置ID中
+                # position_ids: (3, batch_size, sequence_length)
                 position_ids += delta.to(position_ids.device)
 
+        # 调用语言模型进行前向传播
+        # 注意：这里传入的是融合了多模态特征的inputs_embeds，而不是原始的input_ids
         outputs = self.language_model(
-            input_ids=None,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            cache_position=cache_position,
+            input_ids=None,  # 不使用原始token ID，而是使用嵌入
+            position_ids=position_ids,  # 3D位置ID: (3, batch_size, sequence_length)
+            attention_mask=attention_mask,  # 注意力掩码: (batch_size, sequence_length)
+            past_key_values=past_key_values,  # 缓存的键值对
+            inputs_embeds=inputs_embeds,  # 融合多模态特征的嵌入: (batch_size, sequence_length, hidden_size)
+            use_cache=use_cache,  # 是否使用缓存
+            output_attentions=output_attentions,  # 是否输出注意力权重
+            output_hidden_states=output_hidden_states,  # 是否输出隐藏状态
+            return_dict=True,  # 强制返回字典格式
+            cache_position=cache_position,  # 缓存位置: (sequence_length,)
             **kwargs,
         )
 
+        # 构造输出对象
         output = Qwen2_5_VLModelOutputWithPast(
-            last_hidden_state=outputs.last_hidden_state,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            rope_deltas=self.rope_deltas,
+            last_hidden_state=outputs.last_hidden_state,  # 最后一层隐藏状态: (batch_size, sequence_length, hidden_size)
+            past_key_values=outputs.past_key_values,  # 更新后的键值对缓存
+            hidden_states=outputs.hidden_states,  # 所有层的隐藏状态 (如果output_hidden_states=True)
+            attentions=outputs.attentions,  # 所有层的注意力权重 (如果output_attentions=True)
+            rope_deltas=self.rope_deltas,  # RoPE偏移量: (batch_size,)
         )
         return output if return_dict else output.to_tuple()
 
@@ -1428,23 +1752,23 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
     @auto_docstring
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        pixel_values: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.FloatTensor] = None,
-        image_grid_thw: Optional[torch.LongTensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        rope_deltas: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        second_per_grid_ts: Optional[torch.Tensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        input_ids: torch.LongTensor = None,  # 输入token序列，形状: (batch_size, sequence_length)
+        attention_mask: Optional[torch.Tensor] = None,  # 注意力掩码，形状: (batch_size, sequence_length)
+        position_ids: Optional[torch.LongTensor] = None,  # 位置ID，形状: (3, batch_size, sequence_length) 或 (4, batch_size, sequence_length)
+        past_key_values: Optional[Cache] = None,  # 缓存的键值对，用于加速生成
+        inputs_embeds: Optional[torch.FloatTensor] = None,  # 输入嵌入，形状: (batch_size, sequence_length, hidden_size)
+        labels: Optional[torch.LongTensor] = None,  # 标签，用于计算损失，形状: (batch_size, sequence_length)
+        use_cache: Optional[bool] = None,  # 是否使用缓存
+        output_attentions: Optional[bool] = None,  # 是否输出注意力权重
+        output_hidden_states: Optional[bool] = None,  # 是否输出隐藏状态
+        pixel_values: Optional[torch.Tensor] = None,  # 图像像素值，形状: (num_images, channels, height, width)
+        pixel_values_videos: Optional[torch.FloatTensor] = None,  # 视频像素值，形状: (num_videos, frames, channels, height, width)
+        image_grid_thw: Optional[torch.LongTensor] = None,  # 图像网格时空尺寸，形状: (num_images, 3) [temporal, height, width]
+        video_grid_thw: Optional[torch.LongTensor] = None,  # 视频网格时空尺寸，形状: (num_videos, 3) [temporal, height, width]
+        rope_deltas: Optional[torch.LongTensor] = None,  # RoPE位置偏移量，形状: (batch_size,)
+        cache_position: Optional[torch.LongTensor] = None,  # 缓存位置，形状: (sequence_length,)
+        second_per_grid_ts: Optional[torch.Tensor] = None,  # 每个时间网格的秒数，形状: (num_videos,)
+        logits_to_keep: Union[int, torch.Tensor] = 0,  # 保留的logits数量，用于优化内存
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
@@ -1492,47 +1816,58 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         "The image shows a street scene with a red stop sign in the foreground. In the background, there is a large red gate with Chinese characters ..."
         ```"""
 
+        # 设置输出配置参数
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
+        # 调用底层的Qwen2_5_VLModel进行多模态特征融合和语言建模
         outputs = self.model(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            cache_position=cache_position,
+            input_ids=input_ids,  # 输入token序列: (batch_size, sequence_length)
+            pixel_values=pixel_values,  # 图像像素值: (num_images, channels, height, width)
+            pixel_values_videos=pixel_values_videos,  # 视频像素值: (num_videos, frames, channels, height, width)
+            image_grid_thw=image_grid_thw,  # 图像网格尺寸: (num_images, 3)
+            video_grid_thw=video_grid_thw,  # 视频网格尺寸: (num_videos, 3)
+            second_per_grid_ts=second_per_grid_ts,  # 时间网格间隔: (num_videos,)
+            position_ids=position_ids,  # 位置ID: (3, batch_size, sequence_length) 或 (4, batch_size, sequence_length)
+            attention_mask=attention_mask,  # 注意力掩码: (batch_size, sequence_length)
+            past_key_values=past_key_values,  # 缓存的键值对
+            inputs_embeds=inputs_embeds,  # 输入嵌入: (batch_size, sequence_length, hidden_size)
+            use_cache=use_cache,  # 是否使用缓存
+            output_attentions=output_attentions,  # 是否输出注意力权重
+            output_hidden_states=output_hidden_states,  # 是否输出隐藏状态
+            return_dict=True,  # 强制返回字典格式
+            cache_position=cache_position,  # 缓存位置: (sequence_length,)
             **kwargs,
         )
 
+        # 获取最后一层的隐藏状态
+        # hidden_states: (batch_size, sequence_length, hidden_size)
         hidden_states = outputs[0]
 
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        # 只计算必要的logits，如果不计算损失则不将其上转换为float类型以节省内存
+        # 这是一个内存优化技巧，只对序列的最后几个位置计算logits
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # 通过语言模型头部计算词汇表上的logits
+        # logits: (batch_size, logits_to_keep, vocab_size)
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        # 计算损失（如果提供了标签）
         loss = None
         if labels is not None:
+            # 计算交叉熵损失
+            # loss: (1,) 标量张量
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
 
+        # 返回包含损失、logits和其他输出的结果
         return Qwen2_5_VLCausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            rope_deltas=outputs.rope_deltas,
+            loss=loss,  # 语言建模损失: (1,) 或 None
+            logits=logits,  # 预测logits: (batch_size, logits_to_keep, vocab_size)
+            past_key_values=outputs.past_key_values,  # 更新后的键值对缓存
+            hidden_states=outputs.hidden_states,  # 所有层的隐藏状态 (如果output_hidden_states=True)
+            attentions=outputs.attentions,  # 所有层的注意力权重 (如果output_attentions=True)
+            rope_deltas=outputs.rope_deltas,  # RoPE偏移量: (batch_size,)
         )
 
     def prepare_inputs_for_generation(
@@ -1551,8 +1886,32 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         second_per_grid_ts=None,
         **kwargs,
     ):
+        """
+        为生成阶段准备输入，特别处理多模态输入和RoPE位置编码。
+        Prepare inputs for generation, with special handling for multimodal inputs and RoPE position encoding.
+        
+        Args:
+            input_ids: 输入token序列，形状: (batch_size, sequence_length)
+            past_key_values: 缓存的键值对，用于加速生成
+            attention_mask: 注意力掩码，形状: (batch_size, sequence_length)
+            inputs_embeds: 输入嵌入向量，形状: (batch_size, sequence_length, hidden_size)
+            cache_position: 缓存位置信息
+            position_ids: 位置编码ID
+            use_cache: 是否使用缓存
+            pixel_values: 图像像素值
+            pixel_values_videos: 视频像素值
+            image_grid_thw: 图像网格的时间、高度、宽度信息
+            video_grid_thw: 视频网格的时间、高度、宽度信息
+            second_per_grid_ts: 每个网格的时间间隔
+        
+        Returns:
+            model_inputs: 准备好的模型输入字典
+        """
+        # 重写父类方法 -- 在特定情况下我们不希望将图像输入传递给模型
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
 
+        # 调用父类方法获取基础的模型输入
+        # Call parent method to get basic model inputs
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
@@ -1569,13 +1928,19 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             **kwargs,
         )
 
+        # Qwen2-5-VL的position_ids需要结合rope_deltas来准备
         # Qwen2-5-VL position_ids are prepared with rope_deltas
         if position_ids is None:
+            # 仅在预填充阶段计算一次RoPE索引
+            # 编译时无法检查张量值，因此只检查输入长度
+            # 可以安全地假设 `length!=1` 意味着我们处于预填充阶段，因为编译模型目前无法进行辅助解码
             # Calculate RoPE index once per generation in the pre-fill stage only.
             # When compiling, we can't check tensor values thus we check only input length
             # It is safe to assume that `length!=1` means we're in pre-fill because compiled
             # models currently cannot do asssisted decoding
             if cache_position[0] == 0 or self.model.rope_deltas is None:
+                # 计算视觉位置编码和RoPE偏移量
+                # Calculate vision positions and RoPE deltas
                 vision_positions, rope_deltas = self.model.get_rope_index(
                     model_inputs.get("input_ids", None),
                     image_grid_thw=image_grid_thw,
@@ -1583,6 +1948,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     second_per_grid_ts=second_per_grid_ts,
                     attention_mask=attention_mask,
                 )
+                # 保存RoPE偏移量以供后续使用
+                # Save RoPE deltas for subsequent use
                 self.model.rope_deltas = rope_deltas
             # then use the prev pre-calculated rope-deltas to get the correct position ids
             elif "position_ids" in model_inputs:
@@ -1611,47 +1978,77 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
+        获取每个样本中图像和视频的数量，用于计算样本张量的分离长度。
+        这些参数不通过处理器传递，以避免接口修改带来的不可预测影响。
         Get the number of images and videos for each sample to calculate the separation length of the sample tensor.
         These parameters are not passed through the processor to avoid unpredictable impacts from interface modifications.
 
         Args:
             input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                词汇表中输入序列token的索引。
                 Indices of input sequence tokens in the vocabulary.
+            inputs_embeds: 输入嵌入向量，可选
 
         Returns:
-            image_nums (`torch.LongTensor` of shape `(batch_size, num_images_sample)`)
-            video_nums (`torch.LongTensor` of shape `(batch_size, num_videos_sample)`)
+            image_nums (`torch.LongTensor` of shape `(batch_size,)`):
+                每个样本中的图像数量
+                Number of images in each sample
+            video_nums (`torch.LongTensor` of shape `(batch_size,)`):
+                每个样本中的视频数量
+                Number of videos in each sample
         """
+        # 获取配置中的特殊token ID
+        # Get special token IDs from config
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
 
+        # 如果提供了嵌入向量，从嵌入向量中查找特殊token
+        # If embeddings are provided, find special tokens from embeddings
         if inputs_embeds is not None:
+            # 查找视觉开始token的位置
+            # Find vision start token positions
             vision_start_mask = (
                 inputs_embeds
                 == self.get_input_embeddings()(
                     torch.tensor(vision_start_token_id, dtype=torch.long, device=inputs_embeds.device)
                 )
-            )[..., 0]
+            )[..., 0]  # 取第一个维度，形状: (batch_size, sequence_length)
+            
+            # 查找图像token的位置
+            # Find image token positions
             image_mask = (
                 inputs_embeds
                 == self.get_input_embeddings()(
                     torch.tensor(image_token_id, dtype=torch.long, device=inputs_embeds.device)
                 )
-            )[..., 0]
+            )[..., 0]  # 形状: (batch_size, sequence_length)
+            
+            # 查找视频token的位置
+            # Find video token positions
             video_mask = (
                 inputs_embeds
                 == self.get_input_embeddings()(
                     torch.tensor(video_token_id, dtype=torch.long, device=inputs_embeds.device)
                 )
-            )[..., 0]
+            )[..., 0]  # 形状: (batch_size, sequence_length)
         else:
+            # 直接从input_ids中查找特殊token
+            # Directly find special tokens from input_ids
             vision_start_mask = input_ids == vision_start_token_id
             image_mask = input_ids == image_token_id
             video_mask = input_ids == video_token_id
 
+        # 将视觉开始掩码向右移动一位，以匹配紧跟在视觉开始token后的图像/视频token
+        # Shift vision start mask right by one position to match image/video tokens following vision start token
         vision_first_mask = torch.roll(vision_start_mask, shifts=1, dims=1)
+        
+        # 计算每个样本中的图像数量：视觉开始token后紧跟图像token的数量
+        # Count images in each sample: number of image tokens following vision start tokens
         image_nums = torch.sum(vision_first_mask & image_mask, dim=1)
+        
+        # 计算每个样本中的视频数量：视觉开始token后紧跟视频token的数量
+        # Count videos in each sample: number of video tokens following vision start tokens
         video_nums = torch.sum(vision_first_mask & video_mask, dim=1)
 
         return image_nums, video_nums

@@ -24,6 +24,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Qwen2.5-VL 模型的处理器模块
+
+本文件定义了 Qwen2.5-VL 多模态大语言模型的处理器类，用于统一处理文本、图像和视频输入。
+主要功能包括：
+
+1. **多模态输入处理**：
+   - 文本输入的 tokenization
+   - 图像输入的预处理和特征提取
+   - 视频输入的预处理和特征提取
+   - 多模态输入的统一格式化
+
+2. **处理器架构**：
+   - Qwen2_5_VLProcessor：主处理器类，整合文本、图像和视频处理器
+   - 各种 Kwargs 类：定义不同模态输入的参数配置
+   - 特殊 token 处理：管理图像和视频占位符 token
+
+3. **核心处理流程**：
+   - 输入验证和格式化
+   - 多模态特征提取
+   - token 序列生成和对齐
+   - 输出格式统一
+
+4. **主要类和方法**：
+   - Qwen2_5_VLProcessor：主处理器类
+   - __call__：核心处理方法
+   - _get_num_multimodal_tokens：计算多模态 token 数量
+   - batch_decode/decode：文本解码方法
+   - post_process_image_text_to_text：后处理方法
+
+该处理器是 Qwen2.5-VL 模型的关键组件，负责将原始的多模态输入转换为模型可以理解的格式。
+"""
+
 from typing import Optional, Union
 
 import numpy as np
@@ -36,10 +69,42 @@ from ...video_utils import VideoInput
 
 
 class Qwen2_5_VLVideosProcessorKwargs(VideosKwargs, total=False):
+    """
+    Qwen2.5-VL 视频处理器的关键字参数类。
+    
+    继承自 VideosKwargs，用于定义视频处理时的特定参数。
+    该类扩展了基础视频处理参数，添加了 Qwen2.5-VL 模型特有的视频处理配置。
+    
+    Args:
+        fps (Union[list[float], float]):
+            视频的帧率（每秒帧数）。可以是单个浮点数（应用于所有视频）
+            或浮点数列表（每个视频对应一个帧率值）。
+            用于计算视频时间网格和时间戳信息。
+    """
     fps: Union[list[float], float]
 
 
 class Qwen2_5_VLImagesKwargs(ImagesKwargs):
+    """
+    Qwen2.5-VL 图像处理器的关键字参数类。
+    
+    继承自 ImagesKwargs，用于定义图像处理时的特定参数。
+    该类扩展了基础图像处理参数，添加了 Qwen2.5-VL 模型特有的图像处理配置。
+    
+    Args:
+        min_pixels (Optional[int]):
+            图像的最小像素数。用于控制图像缩放的下限，确保图像不会被缩放得过小。
+        max_pixels (Optional[int]):
+            图像的最大像素数。用于控制图像缩放的上限，防止图像过大导致内存问题。
+        patch_size (Optional[int]):
+            图像块的大小。定义将图像分割成小块时每个块的尺寸，
+            影响视觉 Transformer 的输入粒度。
+        temporal_patch_size (Optional[int]):
+            时间维度的块大小。主要用于视频处理，定义时间轴上的分块大小。
+        merge_size (Optional[int]):
+            合并块的大小。用于将多个相邻的图像块合并，
+            影响最终输入到语言模型的 token 数量。
+    """
     min_pixels: Optional[int]
     max_pixels: Optional[int]
     patch_size: Optional[int]
@@ -48,6 +113,24 @@ class Qwen2_5_VLImagesKwargs(ImagesKwargs):
 
 
 class Qwen2_5_VLProcessorKwargs(ProcessingKwargs, total=False):
+    """
+    Qwen2.5-VL 处理器的关键字参数类。
+    
+    继承自 ProcessingKwargs，用于定义多模态处理时的参数配置。
+    该类整合了文本、图像和视频处理的所有参数，提供统一的参数管理接口。
+    
+    Args:
+        images_kwargs (Qwen2_5_VLImagesKwargs):
+            图像处理相关的参数配置。包含图像预处理、缩放、分块等参数。
+        videos_kwargs (Qwen2_5_VLVideosProcessorKwargs):
+            视频处理相关的参数配置。包含视频帧率、时间分块等参数。
+    
+    Attributes:
+        _defaults (dict):
+            默认参数配置。定义了文本处理的默认行为：
+            - padding: False - 默认不进行填充
+            - return_mm_token_type_ids: False - 默认不返回多模态 token 类型 ID
+    """
     images_kwargs: Qwen2_5_VLImagesKwargs
     videos_kwargs: Qwen2_5_VLVideosProcessorKwargs
     _defaults = {
@@ -60,18 +143,27 @@ class Qwen2_5_VLProcessorKwargs(ProcessingKwargs, total=False):
 
 class Qwen2_5_VLProcessor(ProcessorMixin):
     r"""
-    Constructs a Qwen2.5-VL processor which wraps a Qwen2.5-VL image processor and a Qwen2 tokenizer into a single processor.
-    [`Qwen2_5_VLProcessor`] offers all the functionalities of [`Qwen2VLImageProcessor`] and [`Qwen2TokenizerFast`]. See the
-    [`~Qwen2_5_VLProcessor.__call__`] and [`~Qwen2_5_VLProcessor.decode`] for more information.
+    构建 Qwen2.5-VL 处理器，将 Qwen2.5-VL 图像处理器和 Qwen2 分词器封装到单个处理器中。
+    
+    [`Qwen2_5_VLProcessor`] 提供了 [`Qwen2VLImageProcessor`] 和 [`Qwen2TokenizerFast`] 的所有功能。
+    有关更多信息，请参阅 [`~Qwen2_5_VLProcessor.__call__`] 和 [`~Qwen2_5_VLProcessor.decode`]。
+    
+    该处理器是 Qwen2.5-VL 多模态模型的核心组件，负责：
+    1. 统一处理文本、图像和视频输入
+    2. 管理特殊 token（图像和视频占位符）
+    3. 协调不同模态的预处理流程
+    4. 生成模型所需的统一输入格式
+    
     Args:
         image_processor ([`Qwen2VLImageProcessor`], *optional*):
-            The image processor is a required input.
+            图像处理器，是必需的输入。负责图像的预处理、特征提取和格式化。
         tokenizer ([`Qwen2TokenizerFast`], *optional*):
-            The tokenizer is a required input.
+            分词器，是必需的输入。负责文本的 tokenization 和编码。
         video_processor ([`Qwen2_5_VLVideoProcessor`], *optional*):
-            The video processor is a required input.
-        chat_template (`str`, *optional*): A Jinja template which will be used to convert lists of messages
-            in a chat into a tokenizable string.
+            视频处理器，是必需的输入。负责视频的预处理、帧提取和特征化。
+        chat_template (`str`, *optional*):
+            Jinja 模板，用于将聊天中的消息列表转换为可 tokenize 的字符串。
+            支持多轮对话的格式化处理。
     """
 
     attributes = ["image_processor", "tokenizer", "video_processor"]
@@ -103,41 +195,48 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
         **kwargs: Unpack[Qwen2_5_VLProcessorKwargs],
     ) -> BatchFeature:
         """
-        Main method to prepare for the model one or several sequences(s) and image(s). This method forwards the `text`
-        and `kwargs` arguments to Qwen2TokenizerFast's [`~Qwen2TokenizerFast.__call__`] if `text` is not `None` to encode
-        the text. To prepare the vision inputs, this method forwards the `vision_infos` and `kwrags` arguments to
-        Qwen2VLImageProcessor's [`~Qwen2VLImageProcessor.__call__`] if `vision_infos` is not `None`.
+        为模型准备一个或多个序列和图像的主要方法。
+        
+        该方法是 Qwen2.5-VL 处理器的核心接口，负责统一处理多模态输入：
+        - 如果 `text` 不为 `None`，将 `text` 和 `kwargs` 参数转发给 Qwen2TokenizerFast 的 [`~Qwen2TokenizerFast.__call__`] 来编码文本
+        - 如果 `images` 不为 `None`，将图像参数转发给 Qwen2VLImageProcessor 的 [`~Qwen2VLImageProcessor.__call__`] 来处理图像
+        - 如果 `videos` 不为 `None`，将视频参数转发给视频处理器来处理视频
+        
+        处理流程包括：
+        1. 多模态输入的预处理和特征提取
+        2. 特殊 token 的插入和管理
+        3. 不同模态输入的对齐和统一格式化
+        4. 生成模型所需的批量特征
 
         Args:
             images (`PIL.Image.Image`, `np.ndarray`, `torch.Tensor`, `list[PIL.Image.Image]`, `list[np.ndarray]`, `list[torch.Tensor]`):
-                The image or batch of images to be prepared. Each image can be a PIL image, NumPy array or PyTorch
-                tensor. Both channels-first and channels-last formats are supported.
+                要准备的图像或图像批次。每个图像可以是 PIL 图像、NumPy 数组或 PyTorch 张量。
+                支持通道优先和通道最后两种格式。
             text (`str`, `list[str]`, `list[list[str]]`):
-                The sequence or batch of sequences to be encoded. Each sequence can be a string or a list of strings
-                (pretokenized string). If the sequences are provided as list of strings (pretokenized), you must set
-                `is_split_into_words=True` (to lift the ambiguity with a batch of sequences).
+                要编码的序列或序列批次。每个序列可以是字符串或字符串列表（预分词字符串）。
+                如果序列以字符串列表形式提供（预分词），必须设置 `is_split_into_words=True`
+                （以消除与序列批次的歧义）。
             videos (`np.ndarray`, `torch.Tensor`, `list[np.ndarray]`, `list[torch.Tensor]`):
-                The image or batch of videos to be prepared. Each video can be a 4D NumPy array or PyTorch
-                tensor, or a nested list of 3D frames. Both channels-first and channels-last formats are supported.
+                要准备的视频或视频批次。每个视频可以是 4D NumPy 数组或 PyTorch 张量，
+                或 3D 帧的嵌套列表。支持通道优先和通道最后两种格式。
             return_tensors (`str` or [`~utils.TensorType`], *optional*):
-                If set, will return tensors of a particular framework. Acceptable values are:
-                - `'tf'`: Return TensorFlow `tf.constant` objects.
-                - `'pt'`: Return PyTorch `torch.Tensor` objects.
-                - `'np'`: Return NumPy `np.ndarray` objects.
-                - `'jax'`: Return JAX `jnp.ndarray` objects.
+                如果设置，将返回特定框架的张量。可接受的值：
+                - `'tf'`: 返回 TensorFlow `tf.constant` 对象
+                - `'pt'`: 返回 PyTorch `torch.Tensor` 对象
+                - `'np'`: 返回 NumPy `np.ndarray` 对象
+                - `'jax'`: 返回 JAX `jnp.ndarray` 对象
 
         Returns:
-            [`BatchFeature`]: A [`BatchFeature`] with the following fields:
+            [`BatchFeature`]: 包含以下字段的 [`BatchFeature`]：
 
-            - **input_ids** -- List of token ids to be fed to a model. Returned when `text` is not `None`.
-            - **attention_mask** -- List of indices specifying which tokens should be attended to by the model (when
-              `return_attention_mask=True` or if *"attention_mask"* is in `self.model_input_names` and if `text` is not
-              `None`).
-            - **pixel_values** -- Pixel values to be fed to a model. Returned when `images` is not `None`.
-            - **pixel_values_videos** -- Pixel values of videos to be fed to a model. Returned when `videos` is not `None`.
-            - **image_grid_thw** -- List of image 3D grid in LLM. Returned when `images` is not `None`.
-            - **video_grid_thw** -- List of video 3D grid in LLM. Returned when `videos` is not `None`.
-            - **second_per_grid_ts** -- List of video seconds per time grid. Returned when `videos` is not `None`.
+            - **input_ids** -- 要输入模型的 token ID 列表。当 `text` 不为 `None` 时返回。
+            - **attention_mask** -- 指定模型应关注哪些 token 的索引列表（当 `return_attention_mask=True`
+              或 *"attention_mask"* 在 `self.model_input_names` 中且 `text` 不为 `None` 时）。
+            - **pixel_values** -- 要输入模型的像素值。当 `images` 不为 `None` 时返回。
+            - **pixel_values_videos** -- 要输入模型的视频像素值。当 `videos` 不为 `None` 时返回。
+            - **image_grid_thw** -- LLM 中的图像 3D 网格列表。当 `images` 不为 `None` 时返回。
+            - **video_grid_thw** -- LLM 中的视频 3D 网格列表。当 `videos` 不为 `None` 时返回。
+            - **second_per_grid_ts** -- 每个时间网格的视频秒数列表。当 `videos` 不为 `None` 时返回。
         """
         output_kwargs = self._merge_kwargs(
             Qwen2_5_VLProcessorKwargs,
@@ -204,15 +303,24 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
 
     def _get_num_multimodal_tokens(self, image_sizes=None, video_sizes=None, **kwargs):
         """
-        Computes the number of placeholder tokens needed for multimodal inputs with the given sizes.
+        计算给定尺寸的多模态输入所需的占位符 token 数量。
+        
+        该方法是多模态 token 计算的核心函数，用于：
+        1. 根据图像和视频的尺寸计算所需的 token 数量
+        2. 考虑图像块大小和合并策略
+        3. 为模型输入准备正确的 token 占位符数量
+        
         Args:
             image_sizes (`list[list[int]]`, *optional*):
-                The input sizes formatted as (height, width) per each image.
+                每个图像的输入尺寸，格式为 (height, width)。
+                用于计算图像需要多少个 token 来表示。
             video_sizes (`list[list[int]]`, *optional*):
-                The input sizes formatted as (num_frames, height, width) per each video.
+                每个视频的输入尺寸，格式为 (num_frames, height, width)。
+                用于计算视频需要多少个 token 来表示。
+                
         Returns:
-            `MultiModalData`: A `MultiModalData` object holding number of tokens per each of the provided
-            input modalities, along with other useful data.
+            `MultiModalData`: 包含每个提供的输入模态的 token 数量以及其他有用数据的
+            `MultiModalData` 对象。包括图像 token 数量、视频 token 数量和相关的块信息。
         """
 
         vision_data = {}
@@ -242,15 +350,19 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
 
     def batch_decode(self, *args, **kwargs):
         """
-        This method forwards all its arguments to Qwen2TokenizerFast's [`~PreTrainedTokenizer.batch_decode`]. Please
-        refer to the docstring of this method for more information.
+        批量解码方法，将所有参数转发给 Qwen2TokenizerFast 的 [`~PreTrainedTokenizer.batch_decode`]。
+        
+        该方法提供了对底层分词器批量解码功能的直接访问，用于将 token ID 序列
+        转换回可读的文本。有关更多信息，请参阅该方法的文档字符串。
         """
         return self.tokenizer.batch_decode(*args, **kwargs)
 
     def decode(self, *args, **kwargs):
         """
-        This method forwards all its arguments to Qwen2TokenizerFast's [`~PreTrainedTokenizer.decode`]. Please refer to
-        the docstring of this method for more information.
+        单个解码方法，将所有参数转发给 Qwen2TokenizerFast 的 [`~PreTrainedTokenizer.decode`]。
+        
+        该方法提供了对底层分词器解码功能的直接访问，用于将单个 token ID 序列
+        转换回可读的文本。有关更多信息，请参阅该方法的文档字符串。
         """
         return self.tokenizer.decode(*args, **kwargs)
 
@@ -258,21 +370,24 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
         self, generated_outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False, **kwargs
     ):
         """
-        Post-process the output of the model to decode the text.
+        对模型输出进行后处理以解码文本。
+        
+        该方法是多模态模型输出的标准后处理接口，将模型生成的 token ID 序列
+        转换为最终的文本输出。特别适用于图像到文本的生成任务。
 
         Args:
             generated_outputs (`torch.Tensor` or `np.ndarray`):
-                The output of the model `generate` function. The output is expected to be a tensor of shape `(batch_size, sequence_length)`
-                or `(sequence_length,)`.
+                模型 `generate` 函数的输出。输出应该是形状为 `(batch_size, sequence_length)`
+                或 `(sequence_length,)` 的张量。
             skip_special_tokens (`bool`, *optional*, defaults to `True`):
-                Whether or not to remove special tokens in the output. Argument passed to the tokenizer's `batch_decode` method.
+                是否在输出中移除特殊 token。该参数传递给分词器的 `batch_decode` 方法。
             clean_up_tokenization_spaces (`bool`, *optional*, defaults to `False`):
-                Whether or not to clean up the tokenization spaces. Argument passed to the tokenizer's `batch_decode` method.
+                是否清理分词空格。该参数传递给分词器的 `batch_decode` 方法。
             **kwargs:
-                Additional arguments to be passed to the tokenizer's `batch_decode method`.
+                传递给分词器 `batch_decode` 方法的额外参数。
 
         Returns:
-            `list[str]`: The decoded text.
+            `list[str]`: 解码后的文本列表。每个元素对应一个输入序列的解码结果。
         """
         return self.tokenizer.batch_decode(
             generated_outputs,
@@ -283,6 +398,21 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
 
     @property
     def model_input_names(self):
+        """
+        获取模型输入名称列表。
+        
+        该属性整合了分词器和图像处理器的模型输入名称，并添加了 Qwen2.5-VL 特有的输入名称。
+        返回的名称列表定义了模型期望接收的所有输入参数名称。
+        
+        组合逻辑：
+        1. 获取分词器的模型输入名称（如 input_ids, attention_mask 等）
+        2. 获取图像处理器的模型输入名称（如 pixel_values, image_grid_thw 等）
+        3. 合并并去重，保持顺序
+        4. 添加视频处理特有的输入名称（second_per_grid_ts）
+        
+        Returns:
+            list[str]: 模型输入名称的完整列表，包含文本、图像和视频处理的所有必要输入。
+        """
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
         names_from_processor = list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
