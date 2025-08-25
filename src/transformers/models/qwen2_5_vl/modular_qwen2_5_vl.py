@@ -52,7 +52,34 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 from transformers.models.qwen2_vl.processing_qwen2_vl import Qwen2VLImagesKwargs, Qwen2VLProcessor
 
 from ...activations import ACT2FN
-from ...cache_utils import Cache
+from ...cache_utils import Cache  # KV Cache 核心类，用于管理键值对缓存
+
+# ============================================================================
+# KV Cache 机制说明 (Key-Value Cache Mechanism)
+# ============================================================================
+# 
+# KV Cache 是 Transformer 模型中用于加速序列生成的重要优化技术：
+#
+# 1. 基本原理:
+#    - 在自注意力计算中，每个 token 的 key 和 value 向量在生成过程中保持不变
+#    - 通过缓存这些向量，避免在每个生成步骤重复计算所有历史 token 的注意力
+#    - 显著减少计算量，从 O(n²) 降低到 O(n)，其中 n 是序列长度
+#
+# 2. 在 Qwen2.5-VL 中的特殊处理:
+#    - 多模态输入: 图像/视频特征在首次前向传播后被融合到文本嵌入中
+#    - 3D RoPE: 使用三维旋转位置编码处理时空信息，需要特殊的位置索引计算
+#    - rope_deltas 缓存: 预计算的位置编码增量，避免重复计算复杂的多模态位置
+#
+# 3. 生成流程:
+#    - 预填充阶段 (Prefill): 处理完整输入序列，创建初始缓存
+#    - 增量生成 (Incremental): 每次只处理新生成的 token，更新缓存
+#    - 视觉优化: 非首次生成步骤中移除视觉输入，节省计算资源
+#
+# 4. 缓存结构:
+#    - past_key_values: 存储所有层的 key-value 状态
+#    - cache_position: 跟踪当前处理的序列位置
+#    - rope_deltas: 缓存的多模态位置编码增量
+# ============================================================================
 from ...configuration_utils import PretrainedConfig
 from ...feature_extraction_utils import BatchFeature
 from ...image_utils import ImageInput
@@ -851,9 +878,15 @@ class Qwen2_5_VLModel(Qwen2VLModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[Cache] = None,  # KV Cache: 缓存的键值对，用于加速序列生成
+        # - 在首次前向传播时为 None，模型会创建新的缓存
+        # - 在后续生成步骤中包含之前计算的 key 和 value 张量
+        # - 避免重复计算已处理 token 的注意力权重，显著提升生成速度
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
+        use_cache: Optional[bool] = None,  # KV Cache 控制: 是否启用键值对缓存机制
+        # - True: 启用缓存，返回 past_key_values 用于后续生成步骤
+        # - False: 禁用缓存，每次都重新计算所有注意力权重
+        # - None: 使用配置文件中的默认设置 (config.use_cache)
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -862,7 +895,10 @@ class Qwen2_5_VLModel(Qwen2VLModel):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,  # KV Cache 位置索引: 当前生成 token 在缓存中的位置
+        # - shape: (sequence_length,) 表示当前处理的 token 位置
+        # - 用于确定在缓存中存储/检索 key-value 的位置
+        # - 在增量生成时帮助正确更新缓存内容
         second_per_grid_ts: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen2_5_VLModelOutputWithPast]:
@@ -947,8 +983,8 @@ class Qwen2_5_VLModel(Qwen2VLModel):
                 or (inputs_embeds is not None and inputs_embeds.shape[1] != 1)
             )
             prefill_noncompiled_stage = not is_torchdynamo_compiling() and (
-                (cache_position is not None and cache_position[0] == 0)
-                or (past_key_values is None or past_key_values.get_seq_length() == 0)
+                (cache_position is not None and cache_position[0] == 0)  # KV Cache: 缓存位置为0，表示预填充阶段开始
+                or (past_key_values is None or past_key_values.get_seq_length() == 0)  # KV Cache: 无缓存或缓存为空
             )
             if (prefill_compiled_stage or prefill_noncompiled_stage) or self.rope_deltas is None:
                 # 计算 3D RoPE 索引（用于多模态位置编码）
@@ -960,10 +996,12 @@ class Qwen2_5_VLModel(Qwen2VLModel):
                     second_per_grid_ts=second_per_grid_ts,
                     attention_mask=attention_mask,
                 )
-                # 缓存 rope_deltas 用于后续生成步骤
+                # KV Cache 优化: 缓存 rope_deltas 用于后续生成步骤
+                # 避免在每个生成步骤重复计算 RoPE 位置编码，提升推理效率
                 self.rope_deltas = rope_deltas
             else:
-                # 后续生成步骤：使用缓存的 rope_deltas
+                # KV Cache 复用: 后续生成步骤使用缓存的 rope_deltas
+                # 这是增量生成的关键优化，避免重复计算位置编码
                 batch_size, seq_length, _ = inputs_embeds.shape
                 # 创建基础位置 IDs
                 # position_ids: (seq_length,) -> (3, batch_size, seq_length)
@@ -971,7 +1009,8 @@ class Qwen2_5_VLModel(Qwen2VLModel):
                 position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
                 # 应用缓存的位置偏移
                 if cache_position is not None:
-                    # delta: (batch_size, 1)
+                    # KV Cache 位置计算: 结合缓存位置和预计算的 RoPE 增量
+                    # delta: (batch_size, 1) - 当前生成步骤的位置偏移
                     delta = (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
                 else:
                     # delta: (batch_size, seq_length)
@@ -988,13 +1027,15 @@ class Qwen2_5_VLModel(Qwen2VLModel):
             input_ids=None,  # 不使用原始 token IDs，而是使用嵌入
             position_ids=position_ids,  # 3D 位置编码，shape: (3, batch_size, seq_len)
             attention_mask=attention_mask,  # 注意力掩码，shape: (batch_size, seq_len)
-            past_key_values=past_key_values,  # 缓存的键值对
+            past_key_values=past_key_values,  # KV Cache: 传递缓存的键值对给语言模型
+            # - 首次调用时为 None，语言模型会创建新缓存
+            # - 后续调用时包含之前层的 key-value 状态
             inputs_embeds=inputs_embeds,  # 融合后的嵌入，shape: (batch_size, seq_len, hidden_size)
-            use_cache=use_cache,  # 是否使用缓存
+            use_cache=use_cache,  # KV Cache 控制: 指示语言模型是否返回更新后的缓存
             output_attentions=output_attentions,  # 是否输出注意力权重
             output_hidden_states=output_hidden_states,  # 是否输出隐藏状态
             return_dict=True,  # 返回字典格式
-            cache_position=cache_position,  # 缓存位置
+            cache_position=cache_position,  # KV Cache 位置: 告知语言模型当前处理的序列位置
             **kwargs,
         )
 
@@ -1002,7 +1043,10 @@ class Qwen2_5_VLModel(Qwen2VLModel):
         # 包装语言模型的输出，添加多模态特定的信息
         output = Qwen2_5_VLModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,  # 最后隐藏状态，shape: (batch_size, seq_len, hidden_size)
-            past_key_values=outputs.past_key_values,  # 更新后的键值对缓存
+            past_key_values=outputs.past_key_values,  # KV Cache: 更新后的键值对缓存
+            # - 包含所有 Transformer 层的 key-value 状态
+            # - 用于下一次生成步骤的增量计算
+            # - 每层缓存形状: (batch_size, num_heads, seq_len, head_dim)
             hidden_states=outputs.hidden_states,  # 所有层的隐藏状态（如果请求）
             attentions=outputs.attentions,  # 注意力权重（如果请求）
             rope_deltas=self.rope_deltas,  # RoPE 位置偏移，用于后续生成
@@ -1141,12 +1185,12 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
     def prepare_inputs_for_generation(
         self,
         input_ids,
-        past_key_values=None,
+        past_key_values=None,  # KV Cache: 从上一生成步骤传递的缓存键值对
         attention_mask=None,
         inputs_embeds=None,
-        cache_position=None,
+        cache_position=None,  # KV Cache 位置: 当前生成 token 在序列中的位置索引
         position_ids=None,
-        use_cache=True,
+        use_cache=True,  # KV Cache 控制: 生成过程中默认启用缓存以提升速度
         pixel_values=None,
         pixel_values_videos=None,
         image_grid_thw=None,
@@ -1199,11 +1243,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
 
         # Qwen2.5-VL 的 position_ids 需要结合 rope_deltas 来准备
         if position_ids is None:
-            # 仅在预填充阶段计算一次 RoPE 索引
+            # KV Cache 阶段判断: 仅在预填充阶段计算一次 RoPE 索引
             # 编译时无法检查张量值，因此只检查输入长度
             # 可以安全地假设 `length!=1` 意味着我们处于预填充阶段，
             # 因为编译模型目前无法进行辅助解码
-            if cache_position[0] == 0 or self.model.rope_deltas is None:
+            if cache_position[0] == 0 or self.model.rope_deltas is None:  # KV Cache: 首次生成或无缓存状态
                 # 计算视觉位置和 RoPE 增量
                 # vision_positions: (3, seq_len, 1), rope_deltas: (seq_len,)
                 vision_positions, rope_deltas = self.model.get_rope_index(
@@ -1213,13 +1257,15 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                     second_per_grid_ts=second_per_grid_ts,
                     attention_mask=attention_mask,
                 )
-                # 缓存 rope_deltas 以供后续生成步骤使用
+                # KV Cache 优化: 缓存 rope_deltas 以供后续生成步骤使用
+                # 避免在每个 token 生成时重复计算复杂的多模态位置编码
                 self.model.rope_deltas = rope_deltas
-            # 使用之前预计算的 rope_deltas 获取正确的位置 IDs
+            # KV Cache 复用: 使用之前预计算的 rope_deltas 获取正确的位置 IDs
+            # 这是增量生成的核心优化，避免重复计算位置编码
             elif "position_ids" in model_inputs:
                 # position_ids: (1, seq_len)
                 position_ids = model_inputs["position_ids"][None, ...]
-                delta = self.model.rope_deltas  # shape: (cached_seq_len,)
+                delta = self.model.rope_deltas  # KV Cache: 从缓存中获取预计算的 RoPE 增量, shape: (cached_seq_len,)
                 # 重复插值以匹配当前序列长度
                 delta = delta.repeat_interleave(position_ids.shape[1] // delta.shape[0], dim=0)
                 # 应用 RoPE 增量
@@ -1242,11 +1288,12 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             # 其中 4 个维度分别对应：文本位置、视觉 x 位置、视觉 y 位置、视觉 t 位置
             model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)
 
-        # 在非首次生成步骤中，移除像素值以节省计算
-        # 因为视觉特征已经在首次前向传播中计算并缓存
-        if cache_position[0] != 0:
-            model_inputs["pixel_values"] = None  # 清除图像像素值
-            model_inputs["pixel_values_videos"] = None  # 清除视频像素值
+        # KV Cache 优化: 在非首次生成步骤中，移除像素值以节省计算
+        # 因为视觉特征已经在首次前向传播中计算并融合到文本嵌入中
+        # 后续生成步骤只需要处理新的文本 token，无需重复处理视觉输入
+        if cache_position[0] != 0:  # KV Cache: 非首次生成步骤
+            model_inputs["pixel_values"] = None  # 清除图像像素值，节省显存和计算
+            model_inputs["pixel_values_videos"] = None  # 清除视频像素值，节省显存和计算
 
         return model_inputs
 

@@ -32,7 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
+from ...cache_utils import Cache, StaticCache
 from ...generation import GenerationMixin
 from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
@@ -1049,13 +1049,35 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
 
         # torch.jit.trace() doesn't support cache objects in the output
         if use_cache and past_key_values is None and not torch.jit.is_tracing():
-            past_key_values = DynamicCache(config=self.config)
+            # Determine batch size, device and dtype without assuming inputs_embeds is set
+            if inputs_embeds is not None:
+                bs = inputs_embeds.shape[0]
+                device = inputs_embeds.device
+                dtype = inputs_embeds.dtype
+            else:
+                # inputs_embeds is None, so input_ids must be provided
+                bs = input_ids.shape[0]
+                device = input_ids.device
+                dtype = self.embed_tokens.weight.dtype
+            # StaticCache requires max_cache_len parameter
+            max_cache_len = getattr(self.config, 'max_position_embeddings', 32768)
+            past_key_values = StaticCache(
+                config=self.config,
+                max_batch_size=bs,
+                max_cache_len=max_cache_len,
+                device=device,
+                dtype=dtype
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            if past_key_values is not None:
+                # For StaticCache, get_seq_length() returns the current sequence length
+                past_seen_tokens = past_key_values.get_seq_length()
+            else:
+                past_seen_tokens = 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -1927,6 +1949,33 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             use_cache=use_cache,
             **kwargs,
         )
+
+        # Ensure StaticCache is used by default when caching during generation
+        if use_cache and model_inputs.get("past_key_values") is None:
+            # Infer batch size, device and dtype
+            if inputs_embeds is not None:
+                bs = inputs_embeds.shape[0]
+                device = inputs_embeds.device
+                dtype = inputs_embeds.dtype
+            elif model_inputs.get("inputs_embeds") is not None:
+                emb = model_inputs["inputs_embeds"]
+                bs = emb.shape[0]
+                device = emb.device
+                dtype = emb.dtype
+            else:
+                # Prefer local input_ids, otherwise fall back to the one returned by parent
+                ids = input_ids if input_ids is not None else model_inputs.get("input_ids")
+                bs = ids.shape[0]
+                device = ids.device
+                dtype = self.model.embed_tokens.weight.dtype
+            max_cache_len = getattr(self.config, "max_position_embeddings", 32768)
+            model_inputs["past_key_values"] = StaticCache(
+                config=self.config,
+                max_batch_size=bs,
+                max_cache_len=max_cache_len,
+                device=device,
+                dtype=dtype,
+            )
 
         # Qwen2-5-VL的position_ids需要结合rope_deltas来准备
         # Qwen2-5-VL position_ids are prepared with rope_deltas
