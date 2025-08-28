@@ -32,7 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...activations import ACT2FN
-from ...cache_utils import Cache, StaticCache
+from ...cache_utils import Cache, StaticCache, DynamicCache
 from ...generation import GenerationMixin
 from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
@@ -1048,33 +1048,15 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
                 use_cache = False
 
         # torch.jit.trace() doesn't support cache objects in the output
-        if use_cache and past_key_values is None and not torch.jit.is_tracing():
-            # Determine batch size, device and dtype without assuming inputs_embeds is set
-            if inputs_embeds is not None:
-                bs = inputs_embeds.shape[0]
-                device = inputs_embeds.device
-                dtype = inputs_embeds.dtype
-            else:
-                # inputs_embeds is None, so input_ids must be provided
-                bs = input_ids.shape[0]
-                device = input_ids.device
-                dtype = self.embed_tokens.weight.dtype
-            # StaticCache requires max_cache_len parameter
-            max_cache_len = getattr(self.config, 'max_position_embeddings', 32768)
-            past_key_values = StaticCache(
-                config=self.config,
-                max_batch_size=bs,
-                max_cache_len=max_cache_len,
-                device=device,
-                dtype=dtype
-            )
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_position is None:
             if past_key_values is not None:
-                # For StaticCache, get_seq_length() returns the current sequence length
+                # For cache objects, get_seq_length() returns the current sequence length
                 past_seen_tokens = past_key_values.get_seq_length()
             else:
                 past_seen_tokens = 0
@@ -1585,13 +1567,25 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # 如果外部已提供rope_deltas，则优先保存以复用（例如由prepare_inputs_for_generation预先计算）
+        if rope_deltas is not None:
+            self.rope_deltas = rope_deltas
+
         # 如果没有提供输入嵌入，则从input_ids生成
         # inputs_embeds: (batch_size, sequence_length, hidden_size)
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # 处理图像输入
-        if pixel_values is not None:
+        # 当inputs_embeds已在外部（如prepare_inputs_for_generation）完成多模态融合时，跳过本地图像/视频重复处理
+        multimodal_pre_fused = (input_ids is None) and (inputs_embeds is not None)
+        if multimodal_pre_fused and position_ids is None and (pixel_values is not None or pixel_values_videos is not None):
+            # 预融合且存在像素输入时必须显式提供position_ids，否则无法在此处可靠重建多模态位置编码
+            raise ValueError(
+                "When providing pre-fused inputs_embeds (input_ids is None), position_ids must also be provided."
+            )
+
+        # 处理图像输入（仅在未预融合的情况下进行，以避免重复处理和错误依赖input_ids）
+        if (not multimodal_pre_fused) and (pixel_values is not None):
             # 获取图像特征，每个图像返回一个特征张量列表
             # image_embeds: List[torch.Tensor], 每个元素形状为 (image_tokens, hidden_size)
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
@@ -1607,8 +1601,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             # inputs_embeds: (batch_size, sequence_length, hidden_size)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        # 处理视频输入
-        if pixel_values_videos is not None:
+        # 处理视频输入（仅在未预融合的情况下进行）
+        if (not multimodal_pre_fused) and (pixel_values_videos is not None):
             # 获取视频特征，每个视频返回一个特征张量列表
             # video_embeds: List[torch.Tensor], 每个元素形状为 (video_tokens, hidden_size)
             video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
@@ -1639,6 +1633,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             )
             # 如果是预填充阶段或者还没有计算过rope_deltas，则重新计算
             if (prefill_compiled_stage or prefill_noncompiled_stage) or self.rope_deltas is None:
+                if multimodal_pre_fused:
+                    # 在预融合场景下，此分支不可达（上方已强制要求显式传入position_ids）
+                    raise RuntimeError("position_ids should be provided when inputs_embeds are pre-fused.")
                 # 计算3D位置ID和RoPE偏移量
                 # position_ids: (4, batch_size, sequence_length) - 包含文本位置和3D视觉位置
                 # rope_deltas: (batch_size,) - 序列长度与多模态RoPE之间的索引差异
@@ -1651,30 +1648,48 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 )
                 self.rope_deltas = rope_deltas
             else:
-                # 解码阶段：使用缓存的rope_deltas计算位置ID
+                # 解码阶段：使用缓存的rope_deltas计算4D位置ID [text; 3D vision]
                 batch_size, seq_length, _ = inputs_embeds.shape
-                # 创建基础位置ID序列: (sequence_length,)
-                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
-                # 扩展为3D位置格式: (3, batch_size, sequence_length)
-                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
-                # 应用缓存的RoPE偏移量
+                device = inputs_embeds.device
+                # 当前文本起始位置（按步推进）
                 if cache_position is not None:
-                    # delta: (batch_size,)
-                    delta = (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
+                    current_pos_base = int(cache_position[0].item())
+                elif past_key_values is not None:
+                    current_pos_base = past_key_values.get_seq_length()
                 else:
-                    # delta: (batch_size, sequence_length)
-                    delta = torch.zeros((batch_size, seq_length), device=inputs_embeds.device)
-                # 重复delta以匹配batch维度
-                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=1)
-                # 将偏移量添加到位置ID中
-                # position_ids: (3, batch_size, sequence_length)
-                position_ids += delta.to(position_ids.device)
+                    current_pos_base = 0
+                # 文本位置 [1, batch, seq_len]
+                text_pos_base = torch.arange(seq_length, device=device).view(1, 1, -1) + current_pos_base
+                text_positions = text_pos_base.expand(1, batch_size, -1)
+                # 视觉3D位置 [3, batch, seq_len]
+                if self.rope_deltas is not None:
+                    rope_deltas = self.rope_deltas.to(device)
+                    if rope_deltas.dim() == 0:
+                        rope_deltas = rope_deltas.view(1)
+                    if rope_deltas.shape[0] != batch_size:
+                        if rope_deltas.shape[0] == 1:
+                            rope_deltas = rope_deltas.repeat(batch_size)
+                        elif batch_size % rope_deltas.shape[0] == 0:
+                            rope_deltas = rope_deltas.repeat_interleave(batch_size // rope_deltas.shape[0], dim=0)
+                        else:
+                            if rope_deltas.shape[0] > batch_size:
+                                rope_deltas = rope_deltas[:batch_size]
+                            else:
+                                repeat_n = (batch_size + rope_deltas.shape[0] - 1) // rope_deltas.shape[0]
+                                rope_deltas = rope_deltas.repeat(repeat_n)[:batch_size]
+                    vision_pos_value = current_pos_base + torch.arange(seq_length, device=device).view(1, -1)
+                    vision_pos_value = vision_pos_value + rope_deltas.view(-1, 1)
+                    vision_positions = vision_pos_value.unsqueeze(0).expand(3, -1, -1)
+                else:
+                    vision_positions = text_positions.expand(3, -1, -1)
+                # 拼接成4D位置编码 [4, batch, seq_len]
+                position_ids = torch.cat([text_positions, vision_positions], dim=0)
 
         # 调用语言模型进行前向传播
         # 注意：这里传入的是融合了多模态特征的inputs_embeds，而不是原始的input_ids
         outputs = self.language_model(
             input_ids=None,  # 不使用原始token ID，而是使用嵌入
-            position_ids=position_ids,  # 3D位置ID: (3, batch_size, sequence_length)
+            position_ids=position_ids,  # 3D或4D位置ID: (3|4, batch_size, sequence_length)
             attention_mask=attention_mask,  # 注意力掩码: (batch_size, sequence_length)
             past_key_values=past_key_values,  # 缓存的键值对
             inputs_embeds=inputs_embeds,  # 融合多模态特征的嵌入: (batch_size, sequence_length, hidden_size)
@@ -1910,7 +1925,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
     ):
         """
         为生成阶段准备输入，特别处理多模态输入和RoPE位置编码。
+        现在预先计算多模态特征嵌入以支持torch.compile优化。
         Prepare inputs for generation, with special handling for multimodal inputs and RoPE position encoding.
+        Now pre-computes multimodal feature embeddings to support torch.compile optimization.
         
         Args:
             input_ids: 输入token序列，形状: (batch_size, sequence_length)
@@ -1927,7 +1944,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             second_per_grid_ts: 每个网格的时间间隔
         
         Returns:
-            model_inputs: 准备好的模型输入字典
+            model_inputs: 准备好的模型输入字典，包含预计算的inputs_embeds
         """
         # 重写父类方法 -- 在特定情况下我们不希望将图像输入传递给模型
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -1950,24 +1967,26 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             **kwargs,
         )
 
+        # 确定batch_size, device和dtype
+        # Determine batch size, device and dtype
+        if inputs_embeds is not None:
+            bs = inputs_embeds.shape[0]
+            device = inputs_embeds.device
+            dtype = inputs_embeds.dtype
+        elif model_inputs.get("inputs_embeds") is not None:
+            emb = model_inputs["inputs_embeds"]
+            bs = emb.shape[0]
+            device = emb.device
+            dtype = emb.dtype
+        else:
+            # Prefer local input_ids, otherwise fall back to the one returned by parent
+            ids = input_ids if input_ids is not None else model_inputs.get("input_ids")
+            bs = ids.shape[0]
+            device = ids.device
+            dtype = self.model.get_input_embeddings().weight.dtype
+
         # Ensure StaticCache is used by default when caching during generation
         if use_cache and model_inputs.get("past_key_values") is None:
-            # Infer batch size, device and dtype
-            if inputs_embeds is not None:
-                bs = inputs_embeds.shape[0]
-                device = inputs_embeds.device
-                dtype = inputs_embeds.dtype
-            elif model_inputs.get("inputs_embeds") is not None:
-                emb = model_inputs["inputs_embeds"]
-                bs = emb.shape[0]
-                device = emb.device
-                dtype = emb.dtype
-            else:
-                # Prefer local input_ids, otherwise fall back to the one returned by parent
-                ids = input_ids if input_ids is not None else model_inputs.get("input_ids")
-                bs = ids.shape[0]
-                device = ids.device
-                dtype = self.model.embed_tokens.weight.dtype
             max_cache_len = getattr(self.config, "max_position_embeddings", 32768)
             model_inputs["past_key_values"] = StaticCache(
                 config=self.config,
@@ -1976,6 +1995,53 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 device=device,
                 dtype=dtype,
             )
+
+        # 预计算多模态特征嵌入（在预填充阶段或有视觉输入时）
+        # Pre-compute multimodal feature embeddings (during prefill or when visual inputs are present)
+        is_prefill = cache_position is not None and cache_position[0] == 0
+        has_visual_inputs = pixel_values is not None or pixel_values_videos is not None
+        
+        if is_prefill and has_visual_inputs and inputs_embeds is None:
+            # 从input_ids生成基础嵌入
+            # Generate base embeddings from input_ids
+            target_input_ids = input_ids if input_ids is not None else model_inputs.get("input_ids")
+            if target_input_ids is not None:
+                inputs_embeds = self.model.get_input_embeddings()(target_input_ids)
+
+                # 处理图像输入
+                # Process image inputs
+                if pixel_values is not None:
+                    # 获取图像特征并融合到inputs_embeds中
+                    # Get image features and fuse into inputs_embeds
+                    image_embeds = self.model.get_image_features(pixel_values, image_grid_thw)
+                    image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                    
+                    # 获取图像占位符掩码并替换
+                    # Get image placeholder mask and replace
+                    image_mask, _ = self.model.get_placeholder_mask(
+                        target_input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+                    )
+                    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+                # 处理视频输入
+                # Process video inputs
+                if pixel_values_videos is not None:
+                    # 获取视频特征并融合到inputs_embeds中
+                    # Get video features and fuse into inputs_embeds
+                    video_embeds = self.model.get_video_features(pixel_values_videos, video_grid_thw)
+                    video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                    
+                    # 获取视频占位符掩码并替换
+                    # Get video placeholder mask and replace
+                    _, video_mask = self.model.get_placeholder_mask(
+                        target_input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+                    )
+                    inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+                # 将预计算的嵌入传递给模型
+                # Pass pre-computed embeddings to model
+                model_inputs["inputs_embeds"] = inputs_embeds
+                model_inputs["input_ids"] = None  # 清除input_ids，使用inputs_embeds
 
         # Qwen2-5-VL的position_ids需要结合rope_deltas来准备
         # Qwen2-5-VL position_ids are prepared with rope_deltas
@@ -1987,11 +2053,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             # When compiling, we can't check tensor values thus we check only input length
             # It is safe to assume that `length!=1` means we're in pre-fill because compiled
             # models currently cannot do asssisted decoding
-            if cache_position[0] == 0 or self.model.rope_deltas is None:
+            if is_prefill or self.model.rope_deltas is None:
                 # 计算视觉位置编码和RoPE偏移量
                 # Calculate vision positions and RoPE deltas
                 vision_positions, rope_deltas = self.model.get_rope_index(
-                    model_inputs.get("input_ids", None),
+                    model_inputs.get("input_ids", input_ids),
                     image_grid_thw=image_grid_thw,
                     video_grid_thw=video_grid_thw,
                     second_per_grid_ts=second_per_grid_ts,
@@ -2000,22 +2066,78 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 # 保存RoPE偏移量以供后续使用
                 # Save RoPE deltas for subsequent use
                 self.model.rope_deltas = rope_deltas
-            # then use the prev pre-calculated rope-deltas to get the correct position ids
-            elif "position_ids" in model_inputs:
-                position_ids = model_inputs["position_ids"][None, ...]
-                delta = self.model.rope_deltas
-                delta = delta.repeat_interleave(position_ids.shape[1] // delta.shape[0], dim=0)
-                vision_positions = position_ids + delta.expand_as(position_ids)
-                vision_positions = vision_positions.expand(3, vision_positions.shape[1], -1)
-
-            # Concatenate "text + vision" positions into [4, bs, seq-len]
-            if "position_ids" not in model_inputs:
-                text_positions = torch.arange(input_ids, device=input_ids.device)[None, None, :]
+                
+                # Concatenate "text + vision" positions into [4, bs, seq-len]
+                if "position_ids" not in model_inputs:
+                    if input_ids is not None:
+                        text_positions = torch.arange(input_ids.shape[1], device=device)[None, None, :]
+                    else:
+                        target_input_ids = model_inputs.get("input_ids")
+                        text_positions = torch.arange(target_input_ids.shape[1], device=device)[None, None, :]
+                else:
+                    text_positions = model_inputs["position_ids"][None, ...]
+                model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)
             else:
-                text_positions = model_inputs["position_ids"][None, ...]
-            model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)
+                # 解码阶段：使用缓存的rope_deltas构造4D position_ids
+                # Decoding stage: use cached rope_deltas to construct 4D position_ids
+                
+                # 获取当前步的文本位置
+                # Get current step text position
+                if cache_position is not None:
+                    # 使用cache_position作为当前文本位置
+                    # Use cache_position as current text position
+                    current_pos = cache_position[0].item()
+                    text_positions = torch.tensor([current_pos], device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, 1]
+                else:
+                    # 从past_key_values推断当前位置
+                    # Infer current position from past_key_values
+                    if model_inputs.get("past_key_values") is not None:
+                        current_pos = model_inputs["past_key_values"].get_seq_length()
+                    else:
+                        current_pos = 0
+                    text_positions = torch.tensor([current_pos], device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, 1]
+                
+                # 构造3D视觉位置：当前步位置 + rope_deltas
+                # Construct 3D vision positions: current step position + rope_deltas
+                if self.model.rope_deltas is not None:
+                    # rope_deltas: normalize to shape (batch_size, 1)
+                    rope_deltas = self.model.rope_deltas
+                    if rope_deltas.dim() == 1:
+                        rope_deltas = rope_deltas.unsqueeze(-1)
+                    elif rope_deltas.dim() > 2:
+                        rope_deltas = rope_deltas.squeeze(-1)
+                    
+                    # 确保rope_deltas与batch_size对齐
+                    # Ensure rope_deltas aligns with batch_size
+                    if rope_deltas.shape[0] != bs:
+                        if rope_deltas.shape[0] == 1:
+                            rope_deltas = rope_deltas.repeat(bs, 1)
+                        else:
+                            rope_deltas = rope_deltas.repeat_interleave(bs // rope_deltas.shape[0], dim=0)
+                    
+                    # 计算视觉位置：当前文本位置 + rope_deltas
+                    # Calculate vision positions: current text position + rope_deltas
+                    vision_pos_value = current_pos + rope_deltas  # (batch_size, 1)
+                    
+                    # 扩展为3D视觉维度 (temporal, height, width)
+                    # Expand to 3D vision dimensions (temporal, height, width)
+                    vision_positions = vision_pos_value.unsqueeze(0).expand(3, -1, -1)  # [3, batch_size, 1]
+                else:
+                    # 如果没有rope_deltas，使用当前位置作为视觉位置
+                    # If no rope_deltas, use current position as vision position
+                    vision_positions = text_positions.expand(3, bs, -1)  # [3, batch_size, 1]
+                
+                # 确保文本位置也与batch_size对齐
+                # Ensure text positions also align with batch_size
+                text_positions = text_positions.expand(1, bs, -1)  # [1, batch_size, 1]
+                
+                # 拼接成4D position_ids: [text; 3D vision]
+                # Concatenate into 4D position_ids: [text; 3D vision]
+                model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)  # [4, batch_size, 1]
 
-        if cache_position[0] != 0:
+        # 在解码阶段清除视觉输入以避免重复处理
+        # Clear visual inputs during decoding to avoid reprocessing
+        if not is_prefill:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
 

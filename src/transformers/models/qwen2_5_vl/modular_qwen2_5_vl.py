@@ -139,6 +139,8 @@ class Qwen2_5_VLVisionConfig(PretrainedConfig):
         out_hidden_size=3584,
         fullatt_block_indexes=[7, 15, 23, 31],
         initializer_range=0.02,
+        embed_dim=1152,  # 添加缺失的embed_dim属性，与原版本保持一致
+        mlp_ratio=4,  # 添加mlp_ratio属性，与原版本保持一致
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -157,6 +159,8 @@ class Qwen2_5_VLVisionConfig(PretrainedConfig):
         self.fullatt_block_indexes = fullatt_block_indexes
         self.out_hidden_size = out_hidden_size
         self.initializer_range = initializer_range
+        self.embed_dim = embed_dim  # 设置embed_dim属性
+        self.mlp_ratio = mlp_ratio  # 设置mlp_ratio属性
 
 
 class Qwen2_5_VLTextConfig(Qwen2VLTextConfig):
@@ -195,6 +199,25 @@ class Qwen2_5_VLConfig(Qwen2VLConfig):
     """
     model_type = "qwen2_5_vl"
     sub_configs = {"vision_config": Qwen2_5_VLVisionConfig, "text_config": Qwen2_5_VLTextConfig}
+    
+    def __init__(self, **kwargs):
+        # 添加与原始实现对齐的视觉特殊token配置，供position_ids/rope索引计算使用
+        self.vision_start_token_id = 151652
+        
+        # 设置默认的 rope_scaling 配置用于多模态RoPE兼容性
+        if 'text_config' not in kwargs or kwargs['text_config'] is None:
+            kwargs['text_config'] = {}
+        
+        # 如果text_config是字典，确保包含rope_scaling配置
+        if isinstance(kwargs.get('text_config'), dict):
+            if 'rope_scaling' not in kwargs['text_config'] or kwargs['text_config']['rope_scaling'] is None:
+                kwargs['text_config']['rope_scaling'] = {
+                    "mrope_section": [16, 24, 24], 
+                    "rope_type": "default", 
+                    "type": "default"
+                }
+        
+        super().__init__(**kwargs)
 
 
 class Qwen2_5_VLMLP(nn.Module):
@@ -933,6 +956,10 @@ class Qwen2_5_VLModel(Qwen2VLModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # 如果外部提供rope_deltas，则优先保存以复用
+        if rope_deltas is not None:
+            self.rope_deltas = rope_deltas
+
         # 2. 获取文本嵌入
         if inputs_embeds is None:
             # inputs_embeds: (batch_size, seq_len, hidden_size)
@@ -973,59 +1000,21 @@ class Qwen2_5_VLModel(Qwen2VLModel):
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         # 5. 计算位置编码
+        # 5. 使用位置编码
+        # position_ids 应该已经由 prepare_inputs_for_generation 计算并传递进来
+        # 这避免了在 forward 方法中重复计算，提升性能并确保一致性
         if position_ids is None:
-            # 仅在预填充阶段计算一次 RoPE 索引
-            # 编译时无法检查张量值，因此只检查输入长度
-            # 可以安全地假设 `length!=1` 意味着我们处于预填充阶段，
-            # 因为编译模型目前无法进行辅助解码
-            prefill_compiled_stage = is_torchdynamo_compiling() and (
-                (input_ids is not None and input_ids.shape[1] != 1)
-                or (inputs_embeds is not None and inputs_embeds.shape[1] != 1)
-            )
-            prefill_noncompiled_stage = not is_torchdynamo_compiling() and (
-                (cache_position is not None and cache_position[0] == 0)  # KV Cache: 缓存位置为0，表示预填充阶段开始
-                or (past_key_values is None or past_key_values.get_seq_length() == 0)  # KV Cache: 无缓存或缓存为空
-            )
-            if (prefill_compiled_stage or prefill_noncompiled_stage) or self.rope_deltas is None:
-                # 计算 3D RoPE 索引（用于多模态位置编码）
-                # position_ids: (3, batch_size, seq_len), rope_deltas: (batch_size, 1)
-                position_ids, rope_deltas = self.get_rope_index(
-                    input_ids,
-                    image_grid_thw,
-                    video_grid_thw,
-                    second_per_grid_ts=second_per_grid_ts,
-                    attention_mask=attention_mask,
-                )
-                # KV Cache 优化: 缓存 rope_deltas 用于后续生成步骤
-                # 避免在每个生成步骤重复计算 RoPE 位置编码，提升推理效率
-                self.rope_deltas = rope_deltas
-            else:
-                # KV Cache 复用: 后续生成步骤使用缓存的 rope_deltas
-                # 这是增量生成的关键优化，避免重复计算位置编码
-                batch_size, seq_length, _ = inputs_embeds.shape
-                # 创建基础位置 IDs
-                # position_ids: (seq_length,) -> (3, batch_size, seq_length)
-                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
-                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
-                # 应用缓存的位置偏移
-                if cache_position is not None:
-                    # KV Cache 位置计算: 结合缓存位置和预计算的 RoPE 增量
-                    # delta: (batch_size, 1) - 当前生成步骤的位置偏移
-                    delta = (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
-                else:
-                    # delta: (batch_size, seq_length)
-                    delta = torch.zeros((batch_size, seq_length), device=inputs_embeds.device)
-                # 重复 delta 以匹配批次大小
-                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=1)
-                # 添加位置偏移
-                # position_ids: (3, batch_size, seq_length)
-                position_ids += delta.to(position_ids.device)
+            # 作为后备方案，为纯文本输入创建简单的位置编码
+            # 但在正常的生成流程中不应该到达这里
+            batch_size, seq_length = inputs_embeds.shape[:2]
+            device = inputs_embeds.device
+            position_ids = torch.arange(seq_length, device=device).unsqueeze(0).expand(batch_size, -1)
 
         # 6. 通过语言模型处理融合后的多模态嵌入
         # 使用融合了视觉特征的文本嵌入作为输入
         outputs = self.language_model(
             input_ids=None,  # 不使用原始 token IDs，而是使用嵌入
-            position_ids=position_ids,  # 3D 位置编码，shape: (3, batch_size, seq_len)
+            position_ids=position_ids,  # 3D 或 4D 位置编码，shape: (3|4, batch_size, seq_len)
             attention_mask=attention_mask,  # 注意力掩码，shape: (batch_size, seq_len)
             past_key_values=past_key_values,  # KV Cache: 传递缓存的键值对给语言模型
             # - 首次调用时为 None，语言模型会创建新缓存
@@ -1247,7 +1236,13 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             # 编译时无法检查张量值，因此只检查输入长度
             # 可以安全地假设 `length!=1` 意味着我们处于预填充阶段，
             # 因为编译模型目前无法进行辅助解码
-            if cache_position[0] == 0 or self.model.rope_deltas is None:  # KV Cache: 首次生成或无缓存状态
+            cp0 = 0
+            if cache_position is not None:
+                try:
+                    cp0 = int(cache_position[0].item())
+                except Exception:
+                    cp0 = int(cache_position[0]) if hasattr(cache_position, "__getitem__") else int(cache_position)
+            if cp0 == 0 or self.model.rope_deltas is None:  # KV Cache: 首次生成或无缓存状态
                 # 计算视觉位置和 RoPE 增量
                 # vision_positions: (3, seq_len, 1), rope_deltas: (seq_len,)
                 vision_positions, rope_deltas = self.model.get_rope_index(
@@ -1260,38 +1255,85 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 # KV Cache 优化: 缓存 rope_deltas 以供后续生成步骤使用
                 # 避免在每个 token 生成时重复计算复杂的多模态位置编码
                 self.model.rope_deltas = rope_deltas
-            # KV Cache 复用: 使用之前预计算的 rope_deltas 获取正确的位置 IDs
-            # 这是增量生成的核心优化，避免重复计算位置编码
-            elif "position_ids" in model_inputs:
-                # position_ids: (1, seq_len)
-                position_ids = model_inputs["position_ids"][None, ...]
-                delta = self.model.rope_deltas  # KV Cache: 从缓存中获取预计算的 RoPE 增量, shape: (cached_seq_len,)
-                # 重复插值以匹配当前序列长度
-                delta = delta.repeat_interleave(position_ids.shape[1] // delta.shape[0], dim=0)
-                # 应用 RoPE 增量
-                # vision_positions: (1, seq_len, 1) -> (3, seq_len, 1)
-                vision_positions = position_ids + delta.expand_as(position_ids)
-                vision_positions = vision_positions.expand(3, vision_positions.shape[1], -1)
-
-            # 将 "文本 + 视觉" 位置拼接成 [4, batch_size, seq_len] 的格式
-            if "position_ids" not in model_inputs:
-                # 为文本生成位置索引
-                # text_positions: (1, 1, seq_len)
-                text_positions = torch.arange(input_ids, device=input_ids.device)[None, None, :]
+                
+                # 将 "文本 + 视觉" 位置拼接成 [4, batch_size, seq_len] 的格式
+                if input_ids is not None:
+                    seq_len = input_ids.shape[1]
+                    device = input_ids.device
+                    bs = input_ids.shape[0]
+                else:
+                    seq_len = model_inputs["input_ids"].shape[1]
+                    device = model_inputs["input_ids"].device
+                    bs = model_inputs["input_ids"].shape[0]
+                
+                # 确保vision_positions与batch size对齐
+                if vision_positions.shape[1] != bs:
+                    if vision_positions.shape[1] == 1:
+                        vision_positions = vision_positions.expand(-1, bs, -1)
+                    else:
+                        # 如果vision_positions的batch维度不匹配，取第一个batch的结果
+                        vision_positions = vision_positions[:, :1, :].expand(-1, bs, -1)
+                
+                # 文本位置 [1, batch_size, seq_len]  
+                text_positions = torch.arange(seq_len, device=device).view(1, 1, -1).expand(1, bs, -1)
+                # 拼接文本和视觉位置编码 -> [4, batch_size, seq_len]
+                model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)
             else:
-                # 使用现有的位置 IDs
-                # text_positions: (1, seq_len) -> (1, 1, seq_len)
-                text_positions = model_inputs["position_ids"][None, ...]
-            
-            # 拼接文本和视觉位置编码
-            # model_inputs["position_ids"]: (4, batch_size, seq_len)
-            # 其中 4 个维度分别对应：文本位置、视觉 x 位置、视觉 y 位置、视觉 t 位置
-            model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)
+                # 解码阶段：使用缓存的rope_deltas构造4D position_ids
+                # 获取当前步的文本位置
+                if cache_position is not None:
+                    current_pos = cache_position[0].item()
+                    device = model_inputs["input_ids"].device if model_inputs.get("input_ids") is not None else next(self.parameters()).device
+                    text_positions = torch.tensor([current_pos], device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, 1]
+                else:
+                    if model_inputs.get("past_key_values") is not None:
+                        current_pos = model_inputs["past_key_values"].get_seq_length()
+                    else:
+                        current_pos = 0
+                    device = model_inputs["input_ids"].device if model_inputs.get("input_ids") is not None else next(self.parameters()).device
+                    text_positions = torch.tensor([current_pos], device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, 1]
+                
+                # 构造3D视觉位置：当前步位置 + rope_deltas
+                if self.model.rope_deltas is not None:
+                    rope_deltas = self.model.rope_deltas
+                    # 规范到形状 (batch,)
+                    if rope_deltas.dim() == 2 and rope_deltas.shape[-1] == 1:
+                        rope_deltas = rope_deltas.squeeze(-1)
+                    elif rope_deltas.dim() == 0:
+                        rope_deltas = rope_deltas.view(1)
+                    # 推断batch size
+                    bs = model_inputs["input_ids"].shape[0] if model_inputs.get("input_ids") is not None else int(rope_deltas.shape[0])
+                    vision_pos_value = current_pos + rope_deltas.view(-1, 1)  # (batch_size, 1)
+                    vision_positions = vision_pos_value.unsqueeze(0).expand(3, -1, -1)  # [3, batch_size, 1]
+                else:
+                    bs = model_inputs.get("input_ids", torch.tensor([[0]])).shape[0] if model_inputs.get("input_ids") is not None else 1
+                    vision_positions = text_positions.expand(3, bs, -1)  # [3, batch_size, 1]
+                
+                # 优先从输入中推断 batch size
+                if model_inputs.get("input_ids") is not None:
+                    bs = model_inputs["input_ids"].shape[0]
+                elif model_inputs.get("past_key_values") is not None and hasattr(model_inputs["past_key_values"], "batch_size"):
+                    bs = model_inputs["past_key_values"].batch_size
+                elif isinstance(self.model.rope_deltas, torch.Tensor) and self.model.rope_deltas.ndim >= 1:
+                    bs = int(self.model.rope_deltas.shape[0])
+                else:
+                    bs = text_positions.shape[1] if text_positions.ndim == 3 else 1
+                
+                # 确保文本/视觉位置与 batch_size 对齐
+                text_positions = text_positions.expand(1, bs, -1)  # [1, batch_size, 1]
+                if vision_positions.shape[1] != bs:
+                    if vision_positions.shape[1] == 1:
+                        vision_positions = vision_positions.expand(-1, bs, -1)
+                    else:
+                        vision_positions = vision_positions[:, :1, :].expand(-1, bs, -1)
+                
+                # 拼接成4D position_ids: [text; 3D vision]
+                model_inputs["position_ids"] = torch.cat([text_positions, vision_positions], dim=0)  # [4, batch_size, 1]
 
         # KV Cache 优化: 在非首次生成步骤中，移除像素值以节省计算
         # 因为视觉特征已经在首次前向传播中计算并融合到文本嵌入中
         # 后续生成步骤只需要处理新的文本 token，无需重复处理视觉输入
-        if cache_position[0] != 0:  # KV Cache: 非首次生成步骤
+        if cache_position is not None and cache_position[0] != 0:  # KV Cache: 非首次生成步骤
             model_inputs["pixel_values"] = None  # 清除图像像素值，节省显存和计算
             model_inputs["pixel_values_videos"] = None  # 清除视频像素值，节省显存和计算
 

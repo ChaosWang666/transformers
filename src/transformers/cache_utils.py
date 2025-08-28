@@ -1,3 +1,73 @@
+"""
+本文件（cache_utils.py）定义了 Transformers 中文本生成相关的「层级缓存（layer-level cache）」抽象与具体实现，用于在自回归解码中高效复用注意力的 Key/Value（KV）状态。
+
+一、整体设计与术语
+- 层级缓存（Layer Cache）：每一层自注意力都会维护一份 KV 缓存，用于在解码阶段避免重复计算历史 token 的注意力。
+- 统一接口：通过抽象基类 CacheLayerMixin 统一定义缓存的关键操作：
+  1) lazy_initialization(key_states): 延迟初始化缓存张量的形状、dtype、device 等；
+  2) update(key_states, value_states, cache_kwargs): 追加或写入新的 KV，并返回用于注意力计算的 KV；
+  3) get_mask_sizes(cache_position): 返回掩码计算所需的长度信息（kv_length 与 kv_offset）；
+  4) get_seq_length(): 已缓存（或累计）序列长度；
+  5) get_max_cache_shape(): 最大可容纳的序列长度（静态缓存/滑窗缓存用于上层构造注意力 mask）；
+  6) 以及 offload/prefetch/reset/reorder_cache 等实用方法，用于设备迁移、清零复用、beam search 重排等典型流程。
+
+- cache_position：上层会在每一步解码传入一个整数索引张量，指示“本次写入 KV 的位置（时间步）”。静态缓存会根据该位置原地写入；动态缓存则在末尾拼接（append）。
+- 形状约定：key_states/value_states 一般为 [batch_size, num_heads, t, head_dim]，其中 t 是本次写入/参与注意力的新 token 数（解码阶段通常为 1，prefill 阶段可能为多个）。
+
+二、三类核心缓存实现
+1) 动态缓存 DynamicLayer（默认）
+   - 通过在序列维度上拼接方式增长（cat），不设最大长度上限（get_max_cache_shape 返回 -1）。
+   - 优点：使用简单，适配任何长度；缺点：频繁拼接带来额外开销，对 torch.compile 的“静态地址/图稳定”不友好。
+   - get_mask_sizes：kv_length = past_seen_tokens + query_length，kv_offset = 0。
+   - 还提供 crop/batch_repeat_interleave/batch_select_indices 等便捷操作，方便截断、复制与选择样本。
+
+2) 静态缓存 StaticLayer（为 torch.compile 友好而设计）
+   - 预先按照最大长度 max_cache_len 分配定长张量，随后使用 index_copy_ 将新 KV 原地写入对应槽位。
+   - lazy_initialization 会在首次 update 时根据实际张量形状推断 batch、head、dtype、device 并分配背板存储；
+   - 为保证编译图稳定，非 tracing 场景下会调用 torch._dynamo.mark_static_address 标记固定地址；
+   - update 依赖 cache_kwargs["cache_position"] 写入对应位置；若缺省，则回退顺序写入 [0..t-1]；
+   - get_mask_sizes：kv_length 固定返回 max_cache_len，kv_offset = 0；
+   - get_seq_length：通过检测第一批第一个头在序列维度上的“非零占位”数量来近似推断已用长度。
+
+3) 滑动窗口 SlidingWindowLayer（静态缓存的滑窗变体）
+   - 仅保留最近窗口大小（sliding_window）的 KV；max_cache_len 取 min(sliding_window, 预设上限)。
+   - prefill（提示词较长）时：若本次写入超过窗口长度，会缓存“最后 max_cache_len 段”，但返回值仍是完整 KV（便于继续注意力计算）。
+   - 解码（通常 1 token/step）时：当缓存已满，整体左移一位（roll），再将新 token 写入最后一格，实现滑窗；
+   - get_mask_sizes：基于 cache_position 计算 kv_offset（窗口外历史视作偏移），kv_length 取 max(query_length, max_cache_len)。
+
+补充：
+- DynamicSlidingWindowLayer 是“动态缓存 + 滑窗”的组合；
+- ChunkedSlidingLayer 在滑窗基础上增加了 prefill 分块（chunking）优化，适配如 Llama 4 的大规模前填充策略，降低峰值显存并提升吞吐。
+
+三、与上层生成流程的协作
+- 生成入口（generate/greedy/beam 等）通常会创建或传递 past_key_values；
+- 静态缓存需要上层提供 cache_position 来指示“将新 token 的 KV 放到第几个时间步”；
+- get_mask_sizes 的返回（kv_length、kv_offset）被上层用于构造注意力 mask，确保仅对合法历史进行注意力；
+- reorder_cache / batch_* 等在 beam search、采样扩展与剪枝时被调用，保证缓存与批次对齐。
+
+四、何时选用哪种缓存
+- 追求易用与最大灵活性（不限长度/不固定图）：DynamicLayer；
+- 追求编译优化（torch.compile）、稳定地址与高吞吐：StaticLayer / SlidingWindowLayer；
+- 需要长上下文但仅关注最近窗口：SlidingWindow 或其动态/分块变体；
+- 注意：静态缓存需要在初始化时给出 max_cache_len（通常与 config.max_position_embeddings 或预期最大解码步数一致）。
+
+五、性能与内存权衡
+- 动态缓存：内存随实际长度增长，但存在拼接与 Python 调度开销；
+- 静态缓存：一次性分配固定显存，更新为原地写入，利于编译器优化与 CUDA Graph，整体吞吐更优；
+- 滑窗：将历史裁剪为固定窗口，节省显存与注意力复杂度，适合长上下文流式推理。
+
+六、跨设备/复用与兼容性
+- offload/prefetch 用于在 CPU/GPU 间迁移缓存；reset 可在复用同一缓存对象时快速清零；
+- 某些设备（如 MPS）不支持 index_copy_，实现中提供了切片赋值回退；
+- 兼容旧模型：在 cross-attention 场景可能不传 cache_kwargs 或传 None，StaticLayer 会回退到顺序写入 [0..t-1]。
+
+阅读指引：
+- CacheLayerMixin 定义抽象接口；
+- DynamicLayer / DynamicSlidingWindowLayer：按需增长的实现；
+- StaticLayer / SlidingWindowLayer / ChunkedSlidingLayer：预分配+原地写入，适配 compile/graph；
+- Cache 及其子类（DynamicCache/StaticCache/SlidingWindowCache/HybridCache/QuantizedCache/EncoderDecoderCache 等）
+  负责“跨层”管理与封装，提供更新、重排、裁剪、批次操作、早期初始化等高层接口。
+"""
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import Any, Optional
